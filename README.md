@@ -11,36 +11,35 @@ consumers over HTTP.
 ## Architecture
 
 ```
-  ┌──────────────┐ eth_blockNumber            ┌──────────────┐ /eth/v1/beacon/blobs
-  │ EL JSON-RPC  │ eth_getBlockByNumber       │ Beacon REST  │ (fallback: blob_sidecars)
-  └──────▲───────┘                            └──────▲───────┘
-         │ pooled keep-alive HTTP                    │ only for blocks with a matching tx
-┌────────┼───────────────────────────────────────────┼──────────────────────────────┐
-│ drizzle│                                           │                              │
-│  ┌─────┴─────┐   ┌───────────┐   ┌─────────────────┴───────────┐   ┌────────────┐ │
-│  │ headLoop  ├──►│ scheduler ├──►│ N workers (--workers)       ├──►│ emitter    │ │
-│  │ polls head│   │ bounded   │   │ 1. fetch EL block           │   │ reorder    │ │
-│  │ minus     │   │ look-ahead│   │ 2. filter type-3 txs by     │   │ buffer:    │ │
-│  │ confirms  │   │ window    │   │    inbox/batcher (O(1))     │   │ strict L1  │ │
-│  └───────────┘   └───────────┘   │ 3. slot = f(timestamp)      │   │ order;     │ │
-│                                  │ 4. fetch blobs, decode with │   │ parentHash │ │
-│        L2 adapters (pluggable):  │    the L2 adapter           │   │ check →    │ │
-│        opstack · arbitrum · raw  └─────────────────────────────┘   │ Reorg evts │ │
-│        + registerAdapterKind                                       └─────┬──────┘ │
-│                                                                          ▼        │
-│  ┌──────────────────────────────────────────────────────────────────────────────┐ │
-│  │ FeedHub: one feed per L2 · ring buffer for replay · encode once per format   │ │
-│  │ bounded queue per subscriber · slow consumer gets `Lagged`, never blocks      │ │
-│  └───────────────────────────────────┬──────────────────────────────────────────┘ │
-│                     HTTP API :7700   │  stream (binary | ndjson) · poll · status  │
-└──────────────────────────────────────┼────────────────────────────────────────────┘
-                     ┌─────────────────┼─────────────────┐
-                 base indexer     arb indexer      any consumer
+   Ethereum L1
+   +------------------+      +------------------+
+   | Execution node   |      | Beacon node      |
+   | (blocks, txs)    |      | (blobs)          |
+   +--------+---------+      +---------+--------+
+            |                          |
+            v                          v
+   +-------------------------------------------+
+   |                 drizzle                   |
+   |                                           |
+   |   1. Track      follow new L1 blocks      |
+   |   2. Filter     keep blob txs sent to a   |
+   |                 configured L2 inbox       |
+   |   3. Fetch      get only those blobs      |
+   |   4. Decode     L2 adapter (pluggable)    |
+   |   5. Order      emit in L1 order,         |
+   |                 signal reorgs             |
+   |   6. Fan out    one feed per L2           |
+   +---------------------+---------------------+
+                         |  HTTP: stream / poll
+          +--------------+--------------+
+          v              v              v
+     L2 consumer    L2 consumer    L2 consumer
 ```
 
-Everything runs on one chronos event loop. The workers overlap upstream I/O,
-the reorder buffer restores L1 order, and a reorg bumps a generation counter
-so in-flight stale work is discarded. Design details are in [NOTES.md](NOTES.md).
+Steps 1-4 run in parallel across blocks; step 5 puts results back in order.
+Each L2 is just an adapter (inbox address, optional batcher list, and a
+decode function), so supporting a new chain doesn't touch the pipeline.
+Design details are in [NOTES.md](NOTES.md).
 
 ## Throughput
 
