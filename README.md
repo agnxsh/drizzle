@@ -8,6 +8,67 @@ Arbitrum Orbit chain), fetches their blobs from a beacon node, decodes them
 with each L2's own blob encoding, and streams the result to any number of
 consumers over HTTP.
 
+## Architecture
+
+```
+  ┌──────────────┐ eth_blockNumber            ┌──────────────┐ /eth/v1/beacon/blobs
+  │ EL JSON-RPC  │ eth_getBlockByNumber       │ Beacon REST  │ (fallback: blob_sidecars)
+  └──────▲───────┘                            └──────▲───────┘
+         │ pooled keep-alive HTTP                    │ only for blocks with a matching tx
+┌────────┼───────────────────────────────────────────┼──────────────────────────────┐
+│ drizzle│                                           │                              │
+│  ┌─────┴─────┐   ┌───────────┐   ┌─────────────────┴───────────┐   ┌────────────┐ │
+│  │ headLoop  ├──►│ scheduler ├──►│ N workers (--workers)       ├──►│ emitter    │ │
+│  │ polls head│   │ bounded   │   │ 1. fetch EL block           │   │ reorder    │ │
+│  │ minus     │   │ look-ahead│   │ 2. filter type-3 txs by     │   │ buffer:    │ │
+│  │ confirms  │   │ window    │   │    inbox/batcher (O(1))     │   │ strict L1  │ │
+│  └───────────┘   └───────────┘   │ 3. slot = f(timestamp)      │   │ order;     │ │
+│                                  │ 4. fetch blobs, decode with │   │ parentHash │ │
+│        L2 adapters (pluggable):  │    the L2 adapter           │   │ check →    │ │
+│        opstack · arbitrum · raw  └─────────────────────────────┘   │ Reorg evts │ │
+│        + registerAdapterKind                                       └─────┬──────┘ │
+│                                                                          ▼        │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐ │
+│  │ FeedHub: one feed per L2 · ring buffer for replay · encode once per format   │ │
+│  │ bounded queue per subscriber · slow consumer gets `Lagged`, never blocks      │ │
+│  └───────────────────────────────────┬──────────────────────────────────────────┘ │
+│                     HTTP API :7700   │  stream (binary | ndjson) · poll · status  │
+└──────────────────────────────────────┼────────────────────────────────────────────┘
+                     ┌─────────────────┼─────────────────┐
+                 base indexer     arb indexer      any consumer
+```
+
+Everything runs on one chronos event loop. The workers overlap upstream I/O,
+the reorder buffer restores L1 order, and a reorg bumps a generation counter
+so in-flight stale work is discarded. Design details are in [NOTES.md](NOTES.md).
+
+## Throughput
+
+Measured with `make bench` (release build, a single core on an x86-64 Linux dev box):
+
+| stage (per blob)                        | blobs/s | MB/s   |
+|-----------------------------------------|--------:|-------:|
+| hex → blob (JSON hot path)              |  13,200 |  1,730 |
+| OP-stack decode                         |  44,100 |  5,780 |
+| Arbitrum decode                         | 133,500 | 17,500 |
+| wire encode, binary + blob (once/event) |  17,100 |  4,490 |
+
+End to end, catching up 300 L1 blocks × 6 blobs through the full pipeline
+against a mock EL + beacon node:
+
+| upstream RTT | workers | blocks/s | blobs/s | blob MB/s |
+|--------------|--------:|---------:|--------:|----------:|
+| 0            | 16      | 154      | 926     | 122       |
+| 25 ms        | 1       | 17       | 103     | 13        |
+| 25 ms        | 4       | 51       | 309     | 41        |
+| 25 ms        | 16      | 100      | 600     | 79        |
+| 25 ms        | 64      | 139      | 834     | 109       |
+
+The end-to-end figures are a lower bound, because the mock upstream shares
+the relayer's core. Mainnet's maximum is 21 blobs per 12 s block, about
+1.75 blobs/s, so following the chain live uses a tiny fraction of capacity.
+The throughput matters when backfilling. Against remote RPC providers,
+where latency dominates, raise `--workers`.
 
 ## Build
 

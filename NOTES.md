@@ -250,7 +250,7 @@ is optional and why custom feeds can be passed on the CLI.
 |-----------------------------------------|--------:|------:|
 | hex → blob (table-driven, from bytes)   |  13,300 | 1,750 |
 | OP-stack decode                         |  43,300 | 5,680 |
-| Arbitrum decode                         | 198,000 | 26,000|
+| Arbitrum decode (with spare bits)       | 133,500 | 17,500|
 | wire encode binary+blob (once per event)|  17,300 | 4,540 |
 
 End-to-end catch-up (300 L1 blocks × 6 blobs, relayer **and** mock upstream
@@ -267,6 +267,10 @@ sharing one core, so this is a lower bound):
 Mainnet max (21 blobs / 12 s) is 1.75 blobs/s, so live-following is a non-issue;
 the numbers matter for **catch-up/backfill** and for remote RPC providers
 where latency, not CPU, dominates (hence `--workers`).
+
+Arbitrum decode dropped from about 198k to 133k blobs/s after the
+spare-bit fix (dev log, 2026-11-10). That's still the fastest stage.
+The end-to-end table matches the latest run to within noise.
 
 Optimisation log, with what did and didn't help:
 
