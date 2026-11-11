@@ -24,6 +24,8 @@
 ##   Heartbeat := (empty)
 ##
 ## Json: one JSON object per line (ndjson); byte fields are 0x-hex.
+## Summary: like Json, but without `payloads` / `blobs`, only their sizes in
+## `payloadSizes`. Cheap enough to drive a dashboard.
 
 import
   std/json,
@@ -105,7 +107,7 @@ func encodeBinary(ev: FeedEvent, withBlobs: bool): seq[byte] =
   buf[3] = byte(bodyLen)
   buf
 
-proc toJsonNode*(ev: FeedEvent, withBlobs: bool): JsonNode =
+proc toJsonNode*(ev: FeedEvent, withBlobs: bool, withPayloads = true): JsonNode =
   result = %*{"seq": ev.seqNo, "feed": ev.feed, "kind": $ev.kind}
   case ev.kind
   of FeedEventKind.Batch:
@@ -118,9 +120,13 @@ proc toJsonNode*(ev: FeedEvent, withBlobs: bool): JsonNode =
     var hashes = newJArray()
     for vh in ev.versionedHashes: hashes.add %($vh)
     result["versionedHashes"] = hashes
-    var payloads = newJArray()
-    for p in ev.payloads: payloads.add %(p.to0xHex())
-    result["payloads"] = payloads
+    var sizes = newJArray()
+    for p in ev.payloads: sizes.add %p.len
+    result["payloadSizes"] = sizes
+    if withPayloads:
+      var payloads = newJArray()
+      for p in ev.payloads: payloads.add %(p.to0xHex())
+      result["payloads"] = payloads
     if ev.decodeError.len > 0:
       result["decodeError"] = %ev.decodeError
     if withBlobs and ev.blobs.len > 0:
@@ -132,8 +138,8 @@ proc toJsonNode*(ev: FeedEvent, withBlobs: bool): JsonNode =
   of FeedEventKind.Lagged, FeedEventKind.Heartbeat:
     discard
 
-proc encodeJsonLine(ev: FeedEvent, withBlobs: bool): seq[byte] =
-  var s = $ev.toJsonNode(withBlobs)
+proc encodeJsonLine(ev: FeedEvent, withBlobs, withPayloads: bool): seq[byte] =
+  var s = $ev.toJsonNode(withBlobs, withPayloads)
   s.add '\n'
   s.toBytes()
 
@@ -145,8 +151,9 @@ proc encode*(ev: FeedEvent, variant: WireVariant): lent seq[byte] =
       case variant
       of WireVariant.Binary: encodeBinary(ev, false)
       of WireVariant.BinaryWithBlobs: encodeBinary(ev, true)
-      of WireVariant.Json: encodeJsonLine(ev, false)
-      of WireVariant.JsonWithBlobs: encodeJsonLine(ev, true)
+      of WireVariant.Json: encodeJsonLine(ev, false, true)
+      of WireVariant.JsonWithBlobs: encodeJsonLine(ev, true, true)
+      of WireVariant.JsonSummary: encodeJsonLine(ev, false, false)
   ev.encoded[variant]
 
 func wireVariant*(json, withBlobs: bool): WireVariant =

@@ -24,6 +24,7 @@ type
 
   WireVariant* {.pure.} = enum
     Binary, BinaryWithBlobs, Json, JsonWithBlobs
+    JsonSummary  ## ndjson without payload/blob bytes, for dashboards
 
   FeedEvent* = ref object
     seqNo*: uint64     ## per-feed, starts at 1, assigned by the hub

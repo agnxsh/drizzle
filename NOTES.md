@@ -241,6 +241,26 @@ is optional and why custom feeds can be passed on the CLI.
 - 2026-11-10: spec links added as module doc comments in each codec /
   spec module (OP ecotone blob-encoding spec, nitro blobs.go + SequencerInbox,
   EIP-4844, RLP, beacon-APIs). All URLs checked to return 200.
+- 2026-11-10: **web dashboard** at `GET /` (`drizzle/feed/dashboard.html`,
+  baked in with `staticRead`, so there are no runtime files and no CDN).
+  Choices:
+  - It uses only the public API, so a copy can be hosted elsewhere.
+  - New stream `format=summary` (`WireVariant.JsonSummary`): ndjson with
+    `payloadSizes` and no payload hex. Full JSON events carry 400-800 KB of
+    hex per Base batch, and a dashboard only needs sizes. `payloadSizes` is
+    now emitted in every JSON variant. The variant is cached like the
+    others, so N dashboards cost one encode per event.
+  - `/v1/status` gained `version`, `uptimeSecs` and `workers`.
+  - Rates are computed client-side from counter deltas (12 s window, one
+    slot), because per-second rates on a 12 s chain are mostly zeros.
+  - Browsers cap HTTP/1.1 at about 6 connections per origin, so with more
+    than 5 feeds only the selected feed is tailed.
+  - Replayed history isn't highlighted as new.
+  - Verified live against mainnet (PublicNode): backfill showed about
+    1.75 blocks/s and 4.7 blobs/s, Base/OP/Arbitrum events in the tail, and
+    PublicNode rate-limit fetch errors appeared in the Errors tile.
+  - Screenshot gotcha: headless Chrome shoots at the load event, after one
+    poll. Hold load open with a slow resource to see real rates.
 
 ## 9. Throughput: measurements
 

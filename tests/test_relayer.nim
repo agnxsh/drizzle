@@ -168,6 +168,17 @@ suite "Relayer end-to-end":
     let (s404, _) = waitFor session.fetch(parseUri(h.apiUrl & "/v1/feeds/nope/events"))
     check s404 == 404
 
+    # dashboard + status fields it relies on
+    let (sDash, dash) = waitFor session.fetch(parseUri(h.apiUrl & "/"))
+    check sDash == 200
+    check "<title>drizzle relay</title>" in string.fromBytes(dash)
+    let (sStat, stat) = waitFor session.fetch(parseUri(h.apiUrl & "/v1/status"))
+    check sStat == 200
+    let sj = parseJson(string.fromBytes(stat))
+    check sj["version"].getStr.len > 0
+    check sj["workers"].getInt > 0
+    check sj["feeds"]["base"]["published"].getInt == 3
+
     # binary stream with replay from seq 1
     let req = HttpClientRequestRef.get(
       session, h.apiUrl & "/v1/feeds/base/stream?from=1").get

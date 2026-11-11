@@ -90,6 +90,8 @@ proc new*(
     results: newAsyncQueue[BlockOutcome](),
     wake: newAsyncEvent())
 
+func workers*(r: Relayer): int = r.cfg.workers
+
 func window(r: Relayer): uint64 =
   uint64(r.cfg.workers * r.cfg.windowPerWorker)
 

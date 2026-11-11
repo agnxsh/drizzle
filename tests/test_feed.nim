@@ -8,8 +8,8 @@
 {.used.}
 
 import
-  std/strutils,
-  unittest2, chronos,
+  std/[json, strutils],
+  unittest2, chronos, stew/byteutils,
   ../drizzle/feed/[hub, wire],
   ../drizzle/l2/presets,
   ../drizzle/pipeline/reorder
@@ -76,6 +76,17 @@ suite "Wire format":
     check a == b
     check ev.encode(WireVariant.Json).len > 0
     check ev.encode(WireVariant.Json)[^1] == byte('\n')
+
+  test "summary variant carries sizes, not bytes":
+    let ev = batch(1)
+    let full = parseJson(string.fromBytes(ev.encode(WireVariant.Json)))
+    let summ = parseJson(string.fromBytes(ev.encode(WireVariant.JsonSummary)))
+    check "payloads" in full
+    check "payloads" notin summ
+    check "blobs" notin summ
+    check summ["payloadSizes"].len == ev.payloads.len
+    check summ["payloadSizes"][0].getInt == ev.payloads[0].len
+    check summ["txHash"] == full["txHash"]
 
   test "truncated and garbage frames are rejected":
     let frame = batch(1).encode(WireVariant.Binary)

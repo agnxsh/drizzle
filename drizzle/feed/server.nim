@@ -9,11 +9,13 @@
 
 ## Consumer-facing HTTP API.
 ##
+##   GET /                                                        (dashboard)
 ##   GET /health
 ##   GET /v1/status
 ##   GET /v1/feeds
 ##   GET /v1/feeds/{name}/events?from=<seq>&limit=<n>&blobs=0|1      (JSON, poll)
-##   GET /v1/feeds/{name}/stream?from=<seq>&format=bin|json&blobs=0|1 (chunked stream)
+##   GET /v1/feeds/{name}/stream?from=<seq>&format=bin|json|summary&blobs=0|1
+##                                                                (chunked stream)
 ##
 ## Streams send a heartbeat frame when idle so dead peers are noticed, and
 ## end with a `Lagged` frame if the consumer falls `--subscriber-queue`
@@ -23,7 +25,12 @@ import
   std/[json, strutils],
   chronos, chronos/apps/http/httpserver, chronicles,
   ./[hub, wire],
-  ../pipeline/relayer
+  ../pipeline/relayer,
+  ../conf
+
+const
+  DashboardHtml = staticRead("dashboard.html")
+    ## Single self-contained page (no external assets), baked into the binary.
 
 export httpserver
 
@@ -37,6 +44,7 @@ type
     relayer: Relayer
     heartbeat: Duration
     maxPollLimit: int
+    startedAt: Moment
 
 func parseUintParam(req: HttpRequestRef, key: string): Result[Opt[uint64], string] =
   if key notin req.query:
@@ -79,6 +87,9 @@ proc statusJson(s: ApiServer): JsonNode =
       "laggedDrops": f.stats.laggedDrops,
     }
   %*{
+    "version": DrizzleVersion,
+    "uptimeSecs": (Moment.now() - s.startedAt).seconds,
+    "workers": s.relayer.workers,
     "elHead": st.elHead, "safeHead": st.safeHead, "nextBlock": st.nextEmit,
     "blocksProcessed": st.blocksProcessed, "blobTxsMatched": st.blobTxsMatched,
     "blobsFetched": st.blobsFetched, "eventsPublished": st.eventsPublished,
@@ -92,9 +103,11 @@ proc streamFeed(
   let fromSeq = parseUintParam(req, "from").valueOr:
     return await req.respondError(Http400, error)
   let format = req.query.getString("format", "bin")
-  if format notin ["bin", "json"]:
-    return await req.respondError(Http400, "format must be bin or json")
-  let variant = wireVariant(format == "json", req.flagParam("blobs"))
+  if format notin ["bin", "json", "summary"]:
+    return await req.respondError(Http400, "format must be bin, json or summary")
+  let variant =
+    if format == "summary": WireVariant.JsonSummary
+    else: wireVariant(format == "json", req.flagParam("blobs"))
 
   let sub = feed.subscribe(fromSeq).valueOr:
     return await req.respondError(Http410,
@@ -103,7 +116,7 @@ proc streamFeed(
   let resp = req.getResponse()
   resp.status = Http200
   resp.setHeader("Content-Type",
-    if format == "json": "application/x-ndjson" else: "application/octet-stream")
+    if format == "bin": "application/octet-stream" else: "application/x-ndjson")
   resp.setHeader("Cache-Control", "no-cache")
   resp.setHeader("X-Drizzle-Wire-Version", $WireVersion)
   resp.setHeader("X-Drizzle-Head-Seq", $feed.headSeq)
@@ -159,6 +172,14 @@ proc route(
   if req.meth != MethodGet:
     return await req.respondError(Http405, "only GET is supported")
   let parts = req.uri.path.strip(chars = {'/'}).split('/')
+  if parts == @[""] or parts == @["dashboard"]:
+    let headers = HttpTable.init([
+      ("Content-Type", "text/html; charset=utf-8"),
+      ("Cache-Control", "no-cache")])
+    try:
+      return await req.respond(Http200, DashboardHtml, headers)
+    except HttpWriteError as exc:
+      return defaultResponse(exc)
   if parts == @["health"]:
     return await req.respondJson(Http200, %*{"status": "ok"})
   if parts == @["v1", "status"]:
@@ -182,7 +203,8 @@ proc new*(
     T: type ApiServer, address: TransportAddress, hub: FeedHub,
     relayer: Relayer, heartbeat: Duration, maxConnections: int
 ): Result[T, string] =
-  let s = T(hub: hub, relayer: relayer, heartbeat: heartbeat, maxPollLimit: 1000)
+  let s = T(hub: hub, relayer: relayer, heartbeat: heartbeat, maxPollLimit: 1000,
+            startedAt: Moment.now())
 
   proc process(r: RequestFence): Future[HttpResponseRef] {.
       async: (raises: [CancelledError]).} =

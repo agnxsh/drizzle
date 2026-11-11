@@ -103,13 +103,28 @@ or `raw`. Leave out batchers to accept any sender. Run `--help` for all options
 > Preset addresses were correct when written, but batchers rotate. Verify
 > them against each chain's official docs before production use.
 
+## Dashboard
+
+Open `http://localhost:7700/` while drizzle is running. The page is built into
+the binary (no CDN, works offline) and shows:
+
+- pipeline position: L1 head, safe head, last emitted block, how far behind
+- blocks/s, blobs/s and decoded MB/s (12 s average), totals, errors, reorgs
+- 5-minute throughput charts
+- per-feed table: events, decoded bytes, subscribers, lagged drops
+- a live event tail per feed, with reorgs highlighted
+
+It only uses the public API (`/v1/status` and `format=summary` streams), so
+you can host a copy elsewhere and point it at any drizzle instance.
+
 ## Consume
 
 | endpoint | what |
 |---|---|
 | `GET /v1/feeds` | configured feeds |
 | `GET /v1/status` | pipeline and per-feed counters |
-| `GET /v1/feeds/{name}/stream?from=&format=bin\|json&blobs=0\|1` | live chunked stream with replay |
+| `GET /` | dashboard |
+| `GET /v1/feeds/{name}/stream?from=&format=bin\|json\|summary&blobs=0\|1` | live chunked stream with replay (`summary` = sizes only, no payload bytes) |
 | `GET /v1/feeds/{name}/events?from=&limit=&blobs=0\|1` | JSON polling |
 
 ```sh
@@ -138,7 +153,7 @@ drizzle/spec      EIP-4844 types, hex, minimal RLP
 drizzle/l2        adapter interface, OP-stack + Arbitrum codecs, presets
 drizzle/rpc       pooled JSON-RPC / beacon REST clients
 drizzle/pipeline  head tracking, scheduler, workers, reorder, reorgs
-drizzle/feed      events, wire format, fan-out hub, HTTP API
+drizzle/feed      events, wire format, fan-out hub, HTTP API, dashboard
 tests/            unit tests + mock EL/beacon end-to-end tests
 bench/            throughput benchmarks
 ```
