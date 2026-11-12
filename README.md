@@ -95,6 +95,19 @@ nimble also works: `nimble build` / `nimble test`, using `drizzle.nimble`.
   --feed=mychain:opstack:0xINBOX:0xBATCHER
 ```
 
+Beacon endpoints:
+
+- `--beacon-url` is repeatable, in priority order. An endpoint that fails or
+  rate-limits is backed off (Retry-After is respected) and the next one is
+  used.
+- At startup each endpoint is checked: it must be on the same network and
+  must actually serve full blobs. Since PeerDAS, only a node that stores at
+  least half the blob data can, e.g. a supernode.
+- Beacon nodes keep blobs for about 18 days. To backfill further, add
+  `--beacon-archive-url` (any beacon-API-compatible blob archive). Without
+  one, drizzle stops at the first pruned block and says why. It never
+  silently skips a batch.
+
 `--feed` takes a preset name (`base`, `optimism`, `arbitrum-one`) or
 `<name>:<kind>:<inbox>[:<batcher>,...]`, where kind is `opstack`, `arbitrum`
 or `raw`. Leave out batchers to accept any sender. Run `--help` for all options

@@ -40,7 +40,7 @@ proc feedEvents(f: Feed): seq[FeedEvent] = f.eventsSince(0, 1000)
 
 type Harness = object
   chain: MockChain
-  mock: HttpServerRef
+  mocks: seq[HttpServerRef]
   hub: FeedHub
   relayer: Relayer
   api: ApiServer
@@ -48,8 +48,22 @@ type Harness = object
   beacon: BeaconClient
   apiUrl: string
 
-proc setup(chain: MockChain, startBlock: uint64): Harness =
-  let (mock, url) = startMock(chain)
+proc setup(
+    chain: MockChain, startBlock: uint64,
+    live: seq[MockBeacon] = @[newMockBeacon()], archive: seq[MockBeacon] = @[],
+    nowSlot = 110'u64): Harness =
+  ## Every mock server serves the same chain; the EL comes from the first.
+  var
+    mocks: seq[HttpServerRef]
+    liveUrls, archiveUrls: seq[string]
+  for b in live:
+    let (m, url) = startMock(chain, b)
+    mocks.add m
+    liveUrls.add url
+  for b in archive:
+    let (m, url) = startMock(chain, b)
+    mocks.add m
+    archiveUrls.add url
   let adapters = @[
     parseFeedSpec("base").get,
     parseFeedSpec("arbitrum-one").get,
@@ -57,8 +71,10 @@ proc setup(chain: MockChain, startBlock: uint64): Harness =
   let
     index = AdapterIndex.init(adapters).get
     hub = FeedHub.new(adapters, ringSize = 64, queueSize = 64)
-    el = ElClient.new(url, 5.seconds)
-    beacon = BeaconClient.new(url, 5.seconds, BeaconApiMode.Auto)
+    el = ElClient.new(liveUrls[0], 5.seconds)
+    beacon = BeaconClient.new(liveUrls, 5.seconds, BeaconApiMode.Auto,
+                              archiveUrls = archiveUrls)
+  beacon.clock = proc(): uint64 = MockGenesis + MockSlotSecs * nowSlot
   doAssert (waitFor beacon.init()).isOk
   let relayer = Relayer.new(
     RelayerConfig(workers: 4, windowPerWorker: 4, confirmations: 0,
@@ -69,16 +85,17 @@ proc setup(chain: MockChain, startBlock: uint64): Harness =
     initTAddress("127.0.0.1:0"), hub, relayer, 200.milliseconds, 64).get
   api.start()
   relayer.start()
-  Harness(chain: chain, mock: mock, hub: hub, relayer: relayer, api: api,
+  Harness(chain: chain, mocks: mocks, hub: hub, relayer: relayer, api: api,
           el: el, beacon: beacon, apiUrl: "http://" & $api.localAddress)
 
 proc teardown(h: Harness) =
   waitFor h.relayer.stop()
   waitFor h.api.stop()
   waitFor h.el.http.closeWait()
-  waitFor h.beacon.http.closeWait()
-  waitFor h.mock.stop()
-  waitFor h.mock.closeWait()
+  waitFor h.beacon.closeWait()
+  for m in h.mocks:
+    waitFor m.stop()
+    waitFor m.closeWait()
 
 proc buildChain(): (MockChain, seq[seq[byte]], seq[byte]) =
   let chain = MockChain()
@@ -214,6 +231,129 @@ suite "Relayer end-to-end":
     check h.hub.getFeed("base").get.feedEvents[0].payloads == basePayloads
     check chain.sidecarRequests > 0
     teardown(h)
+
+suite "Beacon robustness":
+  test "fails over from a dead endpoint and backs off from it":
+    let (chain, basePayloads, arbPayload) = buildChain()
+    let dead = newMockBeacon()
+    dead.failStatus = 503
+    let h = setup(chain, 100, live = @[dead, newMockBeacon()])
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 106)
+    check h.hub.getFeed("base").get.feedEvents[0].payloads == basePayloads
+    check h.hub.getFeed("arbitrum-one").get.feedEvents[0].payloads == @[arbPayload]
+    check h.beacon.endpoints[0].failures > 0
+    check h.relayer.stats.fetchErrors == 0   # failover is not a failed block
+    teardown(h)
+
+  test "honours 429 Retry-After instead of hammering":
+    let (chain, basePayloads, _) = buildChain()
+    let limited = newMockBeacon()
+    limited.rateLimitFirst = 2
+    limited.retryAfterSecs = 1
+    let started = Moment.now()
+    let h = setup(chain, 100, live = @[limited])
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 106)
+    check Moment.now() - started >= 900.milliseconds
+    check h.hub.getFeed("base").get.feedEvents[0].payloads == basePayloads
+    check limited.rateLimited == 2
+    # 3 blob-carrying blocks + the 429s + at most one in-flight per worker
+    check limited.blobRequests <= 3 + 2 + 4
+    teardown(h)
+
+  test "pruned blobs stall the pipeline with an explanation":
+    let (chain, _, _) = buildChain()
+    let pruned = newMockBeacon()
+    pruned.prunedBelowSlot = 1000
+    pruned.retentionEpochs = 1          # 4 slots
+    let h = setup(chain, 100, live = @[pruned], nowSlot = 200)
+    check waitUntil(proc(): bool = h.relayer.stats.stalledAt == 101)
+    check "retention" in h.relayer.stats.stallReason
+    check "--beacon-archive-url" in h.relayer.stats.stallReason
+    check h.relayer.stats.nextEmit == 101
+    check h.relayer.stats.fetchErrors == 1   # reported once, not per retry
+    teardown(h)
+
+  test "pruned blobs come from the archive, by block root":
+    let (chain, basePayloads, arbPayload) = buildChain()
+    let pruned = newMockBeacon()
+    pruned.prunedBelowSlot = 1000
+    pruned.retentionEpochs = 1
+    let archive = newMockBeacon()
+    archive.sidecarsOnly = true         # blob-archiver style
+    archive.retentionEpochs = 1
+    let h = setup(chain, 100, live = @[pruned], archive = @[archive], nowSlot = 200)
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 106)
+    check h.hub.getFeed("base").get.feedEvents[0].payloads == basePayloads
+    check h.hub.getFeed("arbitrum-one").get.feedEvents[0].payloads == @[arbPayload]
+    check archive.byRootRequests >= 3
+    check h.relayer.stats.stalledAt == 0
+    teardown(h)
+
+  test "a head slot not served yet is waited for, not an error":
+    let (chain, _, _) = buildChain()
+    let lagging = newMockBeacon()
+    lagging.hiddenSlots = @[104'u64]
+    let h = setup(chain, 100, live = @[lagging], nowSlot = 105)
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 104)
+    waitFor sleepAsync(200.milliseconds)
+    check h.relayer.stats.nextEmit == 104
+    lagging.hiddenSlots = @[]
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 106)
+    check h.relayer.stats.fetchErrors == 0
+    teardown(h)
+
+  test "probe ranks endpoints by blob service and drops other networks":
+    let (chain, basePayloads, _) = buildChain()
+    let partial = newMockBeacon()
+    partial.partial = true
+    partial.custodyGroups = 4
+    let wrongNet = newMockBeacon()
+    wrongNet.genesisTime = MockGenesis + 1
+    let full = newMockBeacon()
+    full.custodyGroups = 128
+    var mocks: seq[HttpServerRef]
+    var urls: seq[string]
+    for b in [partial, wrongNet, full]:
+      let (m, url) = startMock(chain, b)
+      mocks.add m
+      urls.add url
+    let beacon = BeaconClient.new(urls, 5.seconds)
+    beacon.clock = proc(): uint64 = MockGenesis + MockSlotSecs * 106
+    check (waitFor beacon.init()).isOk
+    waitFor beacon.probe()
+    check:
+      beacon.endpoints[0].status == EndpointStatus.Partial
+      beacon.endpoints[0].custodyGroups == Opt.some(4'u64)
+      beacon.endpoints[1].status == EndpointStatus.WrongNetwork
+      beacon.endpoints[2].status == EndpointStatus.Full
+      beacon.endpoints[2].resolved == BeaconApiMode.Blobs
+
+    # The full node is preferred even though it's configured last.
+    let before = partial.blobRequests
+    let blk = (waitFor ElClient.new(urls[0], 5.seconds).getBlock(101)).get.get
+    var wanted: seq[WantedBlob]
+    for tx in blk.blobTxs:
+      if tx.to == Address.fromHex(BaseInbox).get:
+        for i, vh in tx.versionedHashes:
+          wanted.add WantedBlob(index: tx.firstBlobIndex + i, versionedHash: vh)
+    let blobs = (waitFor beacon.fetchBlobs(101, wanted)).get
+    check decodeOpBlob(blobs[0][]).get == basePayloads[0]
+    check partial.blobRequests == before
+    check wrongNet.blobRequests == 0
+
+    waitFor beacon.closeWait()
+    for m in mocks:
+      waitFor m.stop()
+      waitFor m.closeWait()
+
+  test "Retry-After parsing and url redaction":
+    check parseRetryAfter("5") == Opt.some(5.seconds)
+    check parseRetryAfter(" 12 ") == Opt.some(12.seconds)
+    check parseRetryAfter("Wed, 21 Oct 2015 07:28:00 GMT").isNone
+    check parseRetryAfter("99999999") == Opt.some(5.minutes)
+    check parseRetryAfter("-1").isNone
+    check displayName("https://eth.example.com/v2/SECRETKEY?x=1") == "https://eth.example.com"
+    check displayName("http://127.0.0.1:5052") == "http://127.0.0.1:5052"
 
 suite "Beacon /blobs fast scanner":
   test "decodes compact and pretty-printed responses":

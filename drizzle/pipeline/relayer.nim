@@ -30,6 +30,9 @@ logScope:
 const
   RecentHashes = 256
   MaxRetryDelay = 5.seconds
+  PrunedRetryDelay = 30.seconds
+    ## Pruned blobs won't come back by themselves; retry slowly in case an
+    ## archive or a longer-retention node becomes available.
 
 type
   RelayerConfig* = object
@@ -49,6 +52,8 @@ type
     decodeErrors*: uint64
     fetchErrors*: uint64
     reorgs*: uint64
+    stalledAt*: uint64       ## block the pipeline is stuck on (0 = not stuck)
+    stallReason*: string     ## why, e.g. blobs pruned from the beacon node
 
   BlockOutcome = object
     generation: uint64
@@ -57,7 +62,9 @@ type
     events: seq[(Feed, FeedEvent)]
 
   ProcessError = object
-    notYet: bool
+    notYet: bool             ## data not there yet: poll again, not an error
+    pruned: bool
+    retryAfter: Opt[Duration]
     msg: string
 
   WorkItem = tuple[generation, number: uint64]
@@ -91,6 +98,7 @@ proc new*(
     wake: newAsyncEvent())
 
 func workers*(r: Relayer): int = r.cfg.workers
+func beacon*(r: Relayer): BeaconClient = r.beacon
 
 func window(r: Relayer): uint64 =
   uint64(r.cfg.workers * r.cfg.windowPerWorker)
@@ -128,7 +136,11 @@ proc processBlock(
       wanted.add WantedBlob(index: tx.firstBlobIndex + i, versionedHash: vh)
 
   let blobs = (await r.beacon.fetchBlobs(slot, wanted)).valueOr:
-    return err(ProcessError(msg: "beacon slot " & $slot & ": " & error))
+    return err(ProcessError(
+      notYet: error.kind == BlobFetchErrorKind.NotYet,
+      pruned: error.kind == BlobFetchErrorKind.Pruned,
+      retryAfter: error.retryAfter,
+      msg: "beacon slot " & $slot & ": " & $error))
   # Blob indices are increasing in tx order, so `wanted` is already sorted
   # and `blobs` lines up with it; index it by blob index for the tx split.
   var byIndex = initTable[int, BlobRef](blobs.len)
@@ -167,18 +179,43 @@ proc processBlock(
 proc processWithRetry(
     r: Relayer, generation, number: uint64
 ): Future[Opt[BlockOutcome]] {.async: (raises: [CancelledError]).} =
-  var delay = 250.milliseconds
+  var
+    delay = 250.milliseconds
+    reportedPruned = false
   while generation == r.generation:
     let res = await r.processBlock(generation, number)
     if res.isOk:
+      if r.stats.stalledAt == number:
+        info "Pipeline unstalled", number
+        r.stats.stalledAt = 0
+        r.stats.stallReason = ""
       return Opt.some(res.get)
-    if res.error.notYet:
+    let e = res.error
+    if e.notYet:
       await sleepAsync(r.cfg.pollInterval)
       continue
+    if e.pruned:
+      # Say it once, loudly; this needs an operator, not a retry storm.
+      # Several workers can hit pruned blocks; one stall is one error.
+      if not reportedPruned:
+        reportedPruned = true
+        if r.stats.stalledAt == 0:
+          inc r.stats.fetchErrors
+          error "Blobs no longer available, pipeline stalled", number,
+            error = e.msg, retryIn = PrunedRetryDelay
+        else:
+          debug "Blobs no longer available", number, error = e.msg
+        if r.stats.stalledAt == 0 or number < r.stats.stalledAt:
+          r.stats.stalledAt = number
+          r.stats.stallReason = e.msg
+      await sleepAsync(PrunedRetryDelay)
+      continue
     inc r.stats.fetchErrors
-    warn "Block processing failed, retrying", number, error = res.error.msg,
-      retryIn = delay
-    await sleepAsync(delay)
+    # A rate-limited or cooling-down upstream says when to come back.
+    let wait = max(delay, e.retryAfter.get(ZeroDuration))
+    warn "Block processing failed, retrying", number, error = e.msg,
+      retryIn = wait
+    await sleepAsync(wait)
     delay = min(delay * 2, MaxRetryDelay)
   Opt.none(BlockOutcome)
 

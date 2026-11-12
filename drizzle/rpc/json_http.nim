@@ -25,12 +25,18 @@ type
     kind*: HttpFailureKind
     status*: int
     msg*: string
+    retryAfter*: Opt[Duration]
+      ## From a `Retry-After: <seconds>` header (429 / 503). The HTTP-date
+      ## form is ignored, our own backoff covers it.
 
   JsonHttpClient* = ref object
     session: HttpSessionRef
     baseUrl: string
     timeout: Duration
     nextId: uint64
+
+const MaxRetryAfter = 5.minutes
+  ## Cap on a server-provided Retry-After, so a bogus header can't park us.
 
 func `$`*(f: HttpFailure): string =
   case f.kind
@@ -39,6 +45,35 @@ func `$`*(f: HttpFailure): string =
 
 func failure(kind: HttpFailureKind, msg: string, status = 0): HttpFailure =
   HttpFailure(kind: kind, status: status, msg: msg)
+
+func retryable*(f: HttpFailure): bool =
+  ## Worth retrying (here or on another endpoint): network trouble, rate
+  ## limits and server-side errors. 4xx other than 429 are answers, not
+  ## outages.
+  case f.kind
+  of HttpFailureKind.Transport, HttpFailureKind.Timeout: true
+  of HttpFailureKind.Status: f.status == 429 or f.status >= 500
+  else: false
+
+func parseRetryAfter*(value: string): Opt[Duration] =
+  let v = value.strip()
+  if v.len == 0 or v.len > 9:
+    return Opt.none(Duration)
+  for c in v:
+    if c notin Digits:
+      return Opt.none(Duration)
+  try:
+    Opt.some(min(parseInt(v).seconds, MaxRetryAfter))
+  except ValueError:
+    Opt.none(Duration)
+
+func displayName*(url: string): string =
+  ## `scheme://host[:port]` only. Hosted RPC providers put API keys in the
+  ## path or query, and those must not end up in logs or `/v1/status`.
+  let u = parseUri(url)
+  if u.hostname.len == 0: return "<invalid url>"
+  result = u.scheme & "://" & u.hostname
+  if u.port.len > 0: result.add ":" & u.port
 
 proc new*(
     T: type JsonHttpClient, baseUrl: string, timeout: Duration,
@@ -54,9 +89,14 @@ proc new*(
 proc closeWait*(c: JsonHttpClient) {.async: (raises: []).} =
   await c.session.closeWait()
 
+type RawResponse = object
+  status: int
+  data: seq[byte]
+  retryAfter: Opt[Duration]
+
 proc request(
     c: JsonHttpClient, meth: HttpMethod, path: string, body: seq[byte]
-): Future[Result[HttpResponseTuple, HttpFailure]] {.async: (raises: [CancelledError]).} =
+): Future[Result[RawResponse, HttpFailure]] {.async: (raises: [CancelledError]).} =
   let headers =
     if body.len > 0: @[("Content-Type", "application/json"), ("Accept", "application/json")]
     else: @[("Accept", "application/json")]
@@ -65,9 +105,20 @@ proc request(
   let req = HttpClientRequestRef.new(
     c.session, address, meth, headers = headers, body = body)
 
-  var res: Result[HttpResponseTuple, HttpFailure]
+  proc exchange(): Future[RawResponse] {.async: (raises: [CancelledError, HttpError]).} =
+    let resp = await req.send()
+    try:
+      var r = RawResponse(status: resp.status)
+      if resp.status in [429, 503]:
+        r.retryAfter = parseRetryAfter(resp.headers.getString("retry-after"))
+      r.data = await resp.getBodyBytes()
+      r
+    finally:
+      await resp.closeWait()
+
+  var res: Result[RawResponse, HttpFailure]
   try:
-    res = ok(await req.fetch().wait(c.timeout))
+    res = ok(await exchange().wait(c.timeout))
   except AsyncTimeoutError:
     res = err(failure(HttpFailureKind.Timeout, $meth & " " & path))
   except HttpError as exc:
@@ -91,7 +142,9 @@ proc getRaw*(
   let resp = ? await c.request(MethodGet, path, @[])
   if resp.status != 200:
     let snippet = string.fromBytes(resp.data[0 ..< min(resp.data.len, 256)])
-    return err(failure(HttpFailureKind.Status, snippet, resp.status))
+    var f = failure(HttpFailureKind.Status, snippet, resp.status)
+    f.retryAfter = resp.retryAfter
+    return err(f)
   ok resp.data
 
 proc parseJsonBody*(data: openArray[byte]): Result[JsonNode, HttpFailure] =
@@ -110,7 +163,9 @@ proc rpcCall*(
   let body = $(%*{"jsonrpc": "2.0", "id": c.nextId, "method": meth, "params": params})
   let resp = ? await c.request(MethodPost, "", body.toBytes())
   if resp.status != 200:
-    return err(failure(HttpFailureKind.Status, meth, resp.status))
+    var f = failure(HttpFailureKind.Status, meth, resp.status)
+    f.retryAfter = resp.retryAfter
+    return err(f)
   let node = ? parseBody(resp.data)
   if node.kind != JObject:
     return err(failure(HttpFailureKind.Decode, "rpc response is not an object"))

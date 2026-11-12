@@ -108,7 +108,7 @@ proc e2e(blocks, blobsPerBlock, workers: int, latency: Duration) =
 
   waitFor relayer.stop()
   waitFor el.http.closeWait()
-  waitFor beacon.http.closeWait()
+  waitFor beacon.closeWait()
   waitFor mock.stop()
   waitFor mock.closeWait()
 

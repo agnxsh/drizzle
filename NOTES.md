@@ -147,7 +147,66 @@ nodes. `--beacon-api=auto|blobs|sidecars`:
 - For `sidecars` we request `?indices=` and **verify**
   `kzg_to_versioned_hash(commitment) == expected` for each one.
 
-**TODO (security), opt-in:** neither path verifies blob ↔ commitment
+### Multiple endpoints, failures, retention (2026-11-12)
+
+- **Endpoints.** `--beacon-url` is repeatable (priority order).
+  `--beacon-archive-url` adds archives. Each endpoint has its own client,
+  API mode, probe status and cooldown. Logs and `/v1/status` show only
+  `scheme://host:port`, because providers put API keys in the path.
+- **Failure classes** (`BlobFetchError`):
+  - `Unavailable`: transport, timeout, 5xx or 429 on every usable endpoint.
+    The endpoint cools down for Retry-After when sent (capped at 5 min),
+    otherwise 1 s doubling to 60 s. The error carries the earliest cooldown,
+    so the relayer sleeps that long. This stops 16 workers from retrying a
+    rate-limited provider in lockstep.
+  - `NotYet`: a miss within 2 slots of the wall-clock head. The beacon node
+    can trail the EL slightly, so this is polled again and not counted as
+    an error.
+  - `Pruned`: a miss for a slot older than the retention window. The window
+    comes from the spec: `MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS`, or
+    `MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS`, default 4096 epochs, about 18.2
+    days. The relayer stalls on that block and logs one error. It sets
+    `stalledAt`/`stallReason` in `/v1/status` and retries every 30 s. It does
+    **not** skip: skipping would silently drop an L2 batch.
+  - `Invalid`: data that doesn't match the block, such as a commitment
+    mismatch. The next endpoint is tried.
+- **Pruning memory.** When a live node misses an expired slot S, it isn't
+  asked again for anything older than S (`prunedBelow`), so a long backfill
+  doesn't spend a request per block on a node that has nothing.
+- **Archives** are asked only for expired slots, or for slots every live node
+  missed outside the head grace window. Requests go **by block root**:
+  blob-archiver indexes by root, and a regular beacon node accepts roots
+  too. The root comes from a live node's `/eth/v1/beacon/headers/{slot}`,
+  since headers aren't pruned. The sidecar commitment check still applies,
+  so an archive is held to the same standard as a live node.
+- **PeerDAS probe** (`--beacon-probe`, default on). At startup, for each
+  live endpoint:
+  1. Compare genesis. A mismatch is `WrongNetwork` and the endpoint is
+     never used.
+  2. Read `custody_group_count` from `/eth/v1/node/identity` (Fulu
+     metadata).
+  3. Ask for all blobs of a recent blob-carrying block, searching back up
+     to 8 slots. If the block exists but blobs aren't served, the endpoint
+     is `Partial`.
+  4. With no recent blobs to test, decide by custody: at least half of
+     `NUMBER_OF_CUSTODY_GROUPS` means the node can reconstruct.
+
+  Order becomes Full, then Unknown, then Partial. Partial endpoints are kept
+  as a last resort because the probe can be wrong. If no endpoint looks
+  usable, drizzle logs a warning but doesn't stop. The probe also settles
+  `Auto` mode up front.
+- **Start-block check**: if `--start-block` is already past retention and
+  no archive is configured, warn at startup instead of stalling later.
+- Mainnet, 2026-11-12: PublicNode reports 128/128 custody groups and serves
+  `/blobs`. A dead primary (`127.0.0.1:59999`) was skipped by the probe
+  ordering and the cooldown.
+  A backfill from 20 days ago (past the 18.2-day minimum) got the start-block
+  warning, but PublicNode **still served** those blobs. It keeps them longer
+  than the spec requires. So retention only gates the *classification* of a
+  miss, never whether drizzle asks. The actual pruned path is covered by the
+  mock tests only, because no public node that prunes on schedule was at hand.
+
+ blob ↔ commitment
 with a KZG proof by default; we trust the beacon node. Planned as an opt-in
 `--verify-kzg` flag (off by default, per the 2026-11-10 decision): vendor
 `c-kzg-4844` (or `nim-kzg4844`) and, when the flag is set, run
@@ -320,6 +379,14 @@ Where the next 2x would come from:
 
 ## 10. Open items / next steps
 
+- [x] Beacon robustness: multi-endpoint failover, Retry-After, pruned
+      detection + archive fallback, PeerDAS probe (section 6).
+- [ ] Fetch by block root for live nodes too (exact fork; EIP-4788 gives the
+      parent root, so this needs the child block or a headers lookup).
+- [ ] SSZ blob responses (`Accept: application/octet-stream`): half the
+      bytes and no hex decode.
+- [ ] Check tx receipt status for matched blob txs (a reverted tx to an
+      inbox contract still sits in the block).
 - [ ] Optional KZG verification behind `--verify-kzg` (off by default,
       section 6): vendor c-kzg-4844 as a submodule; only linked into the
       hot path when the flag is set.

@@ -30,10 +30,18 @@ type
       defaultValue: "http://127.0.0.1:8545"
       name: "el-url" .}: string
 
-    beaconUrl* {.
-      desc: "Beacon node REST API URL"
-      defaultValue: "http://127.0.0.1:5052"
-      name: "beacon-url" .}: string
+    beaconUrls* {.
+      desc: "Beacon node REST API URL (repeatable, in priority order; default http://127.0.0.1:5052). Failing or rate-limited endpoints are backed off and the next one is used"
+      name: "beacon-url" .}: seq[string]
+
+    beaconArchiveUrls* {.
+      desc: "Beacon-API-compatible blob archive (repeatable), only used for blobs the beacon nodes have pruned (older than ~18 days), e.g. a blob-archiver"
+      name: "beacon-archive-url" .}: seq[string]
+
+    beaconProbe* {.
+      desc: "At startup, check each beacon endpoint's network and whether it serves full blobs (PeerDAS custody). Costs one block of blobs per endpoint"
+      defaultValue: true
+      name: "beacon-probe" .}: bool
 
     beaconApi* {.
       desc: "Blob endpoint: auto, blobs (/eth/v1/beacon/blobs) or sidecars (/eth/v1/beacon/blob_sidecars)"

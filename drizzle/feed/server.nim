@@ -72,6 +72,20 @@ proc respondError(
 ): Future[HttpResponseRef] {.async: (raises: [CancelledError], raw: true).} =
   req.respondJson(code, %*{"error": msg})
 
+proc beaconJson(s: ApiServer): JsonNode =
+  result = newJArray()
+  let now = Moment.now()
+  for ep in s.relayer.beacon.endpoints:
+    result.add %*{
+      "endpoint": ep.name, "role": $ep.role, "api": $ep.resolved,
+      "status": $ep.status,
+      "custodyGroups":
+        if ep.custodyGroups.isSome: %ep.custodyGroups.get else: newJNull(),
+      "consecutiveFailures": ep.failures,
+      "coolingDownMs":
+        if ep.cooldownUntil > now: (ep.cooldownUntil - now).milliseconds else: 0,
+    }
+
 proc statusJson(s: ApiServer): JsonNode =
   let st = s.relayer.stats
   var feeds = newJObject()
@@ -94,7 +108,9 @@ proc statusJson(s: ApiServer): JsonNode =
     "blocksProcessed": st.blocksProcessed, "blobTxsMatched": st.blobTxsMatched,
     "blobsFetched": st.blobsFetched, "eventsPublished": st.eventsPublished,
     "decodeErrors": st.decodeErrors, "fetchErrors": st.fetchErrors,
-    "reorgs": st.reorgs, "feeds": feeds,
+    "reorgs": st.reorgs,
+    "stalledAt": st.stalledAt, "stallReason": st.stallReason,
+    "beacon": s.beaconJson(), "feeds": feeds,
   }
 
 proc streamFeed(

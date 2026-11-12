@@ -45,11 +45,35 @@ proc waitForBeacon(beacon: BeaconClient) {.async: (raises: [CancelledError]).} =
     let res = await beacon.init()
     if res.isOk:
       info "Connected to beacon node", genesisTime = beacon.genesisTime,
-        secondsPerSlot = beacon.secondsPerSlot
+        secondsPerSlot = beacon.secondsPerSlot,
+        blobRetentionEpochs = beacon.retentionEpochs,
+        endpoints = beacon.endpoints.len
       return
     warn "Beacon node not ready, retrying", error = res.error, retryIn = delay
     await sleepAsync(delay)
     delay = min(delay * 2, 30.seconds)
+
+proc checkStartBlock(
+    el: ElClient, beacon: BeaconClient, number: uint64
+) {.async: (raises: [CancelledError]).} =
+  ## Warn up front when a backfill starts in pruned territory, instead of
+  ## letting the pipeline stall on its first blob-carrying block.
+  let blk = (await el.getBlock(number)).valueOr:
+    return
+  if blk.isNone: return
+  let slot = beacon.slotAt(blk.get.timestamp).valueOr:
+    return
+  if beacon.isExpired(slot):
+    if beacon.hasArchive:
+      info "Start block is past beacon blob retention; older blobs will come from the archive",
+        startBlock = number, slot, retentionSlots = beacon.retentionSlots
+    else:
+      warn "Start block is older than the spec's minimum blob retention. " &
+        "Many beacon nodes prune these blobs (some keep them longer); if yours " &
+        "has, the pipeline will stall at the first missing one. Add " &
+        "--beacon-archive-url or start later",
+        startBlock = number, slot, currentSlot = beacon.currentSlot(),
+        retentionSlots = beacon.retentionSlots
 
 proc run(config: DrizzleConf) {.raises: [CatchableError].} =
   setupLogLevel(config.logLevel)
@@ -82,8 +106,12 @@ proc run(config: DrizzleConf) {.raises: [CatchableError].} =
   let
     timeout = config.requestTimeoutMs.milliseconds
     el = ElClient.new(config.elUrl, timeout, config.maxUpstreamConnections)
+    beaconUrls =
+      if config.beaconUrls.len > 0: config.beaconUrls
+      else: @["http://127.0.0.1:5052"]
     beacon = BeaconClient.new(
-      config.beaconUrl, timeout, mode, config.maxUpstreamConnections)
+      beaconUrls, timeout, mode, config.maxUpstreamConnections,
+      archiveUrls = config.beaconArchiveUrls)
     hub = FeedHub.new(adapters, config.ringSize, config.subscriberQueue)
     rcfg = RelayerConfig(
       workers: config.workers,
@@ -108,6 +136,10 @@ proc run(config: DrizzleConf) {.raises: [CatchableError].} =
   waitFor waitForBeacon(beacon)
   if status != DrizzleStatus.Running:
     return
+  if config.beaconProbe:
+    waitFor beacon.probe()
+  if config.startBlock.isSome:
+    waitFor checkStartBlock(el, beacon, config.startBlock.get)
 
   api.start()
   info "Feed API listening", address = $api.localAddress
@@ -119,7 +151,7 @@ proc run(config: DrizzleConf) {.raises: [CatchableError].} =
   waitFor relayer.stop()
   waitFor api.stop()
   waitFor el.http.closeWait()
-  waitFor beacon.http.closeWait()
+  waitFor beacon.closeWait()
   notice "drizzle stopped"
 
 when isMainModule:
