@@ -40,24 +40,33 @@ type
     ## payloads. Must be pure: it runs on the hot path and may be moved to a
     ## worker thread pool later.
 
+  AdapterKind* = object
+    decode*: DecodeProc
+    requireSuccess*: bool
+      ## Only successful txs carry batches. True when the L2 derives batches
+      ## from inbox contract events (Arbitrum's SequencerBatchDelivered), so
+      ## a reverted tx's blobs are not a batch. False for OP-stack: op-node
+      ## reads batcher txs to an EOA inbox without looking at receipts.
+
   L2Adapter* = ref object
     name*: string            ## feed name, unique, e.g. "base"
     kind*: string            ## adapter kind, e.g. "opstack"
     inbox*: Address          ## L1 `to` address of batch transactions
     batchers*: seq[Address]  ## allowed senders; empty = accept any sender
     decode*: DecodeProc
+    requireSuccess*: bool    ## see `AdapterKind.requireSuccess`
 
   AdapterIndex* = object
     ## `to` address -> adapters, so that per-tx filtering is a single lookup.
     byInbox: Table[Address, seq[L2Adapter]]
     all*: seq[L2Adapter]
 
-var adapterKinds: Table[string, DecodeProc]
+var adapterKinds: Table[string, AdapterKind]
   ## Written at module-init time only, read during startup. Never touched
   ## from async code, so no gcsafe concerns in practice.
 
-proc registerAdapterKind*(kind: string, decode: DecodeProc) =
-  adapterKinds[kind.toLowerAscii] = decode
+proc registerAdapterKind*(kind: string, decode: DecodeProc, requireSuccess = false) =
+  adapterKinds[kind.toLowerAscii] = AdapterKind(decode: decode, requireSuccess: requireSuccess)
 
 proc registeredKinds*(): seq[string] =
   for k in adapterKinds.keys: result.add k
@@ -65,15 +74,15 @@ proc registeredKinds*(): seq[string] =
 proc newAdapter*(
     name, kind: string, inbox: Address, batchers: seq[Address] = @[]
 ): Result[L2Adapter, string] =
-  let decode = adapterKinds.getOrDefault(kind.toLowerAscii)
-  if decode.isNil:
+  let k = adapterKinds.getOrDefault(kind.toLowerAscii)
+  if k.decode.isNil:
     return err("unknown adapter kind '" & kind & "', known: " &
                registeredKinds().join(", "))
   if name.len == 0 or not name.allCharsInSet(IdentChars + {'-'}):
     return err("invalid feed name '" & name & "'")
   ok L2Adapter(
     name: name, kind: kind.toLowerAscii, inbox: inbox, batchers: batchers,
-    decode: decode)
+    decode: k.decode, requireSuccess: k.requireSuccess)
 
 func accepts*(a: L2Adapter, tx: BlobTx): bool =
   a.inbox == tx.to and (a.batchers.len == 0 or tx.sender in a.batchers)

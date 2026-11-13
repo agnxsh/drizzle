@@ -15,6 +15,7 @@ import
   ./conf,
   ./l2/presets,
   ./rpc/[el_client, beacon_client],
+  ./spec/blob_kzg,
   ./feed/[hub, server],
   ./pipeline/relayer
 
@@ -136,6 +137,13 @@ proc run(config: DrizzleConf) {.raises: [CatchableError].} =
   waitFor waitForBeacon(beacon)
   if status != DrizzleStatus.Running:
     return
+  if config.verifyKzg:
+    let kzg = loadKzgSetup()
+    if kzg.isErr:
+      fatal "Failed to load the KZG trusted setup", error = kzg.error
+      quit QuitFailure
+    beacon.verifyKzg = true
+    info "KZG verification enabled: every blob is checked against its versioned hash"
   if config.beaconProbe:
     waitFor beacon.probe()
   if config.startBlock.isSome:

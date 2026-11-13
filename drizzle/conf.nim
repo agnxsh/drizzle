@@ -43,6 +43,11 @@ type
       defaultValue: true
       name: "beacon-probe" .}: bool
 
+    verifyKzg* {.
+      desc: "Verify every fetched blob against its versioned hash (KZG commitment), so a faulty beacon node can't feed other data. ~4 ms CPU per blob"
+      defaultValue: false
+      name: "verify-kzg" .}: bool
+
     beaconApi* {.
       desc: "Blob endpoint: auto, blobs (/eth/v1/beacon/blobs) or sidecars (/eth/v1/beacon/blob_sidecars)"
       defaultValue: "auto"

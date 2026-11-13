@@ -59,12 +59,13 @@ proc microBenchmarks() =
     sink += ev.encode(WireVariant.BinaryWithBlobs).len
   doAssert sink != 0
 
-proc e2e(blocks, blobsPerBlock, workers: int, latency: Duration) =
+proc e2e(blocks, blobsPerBlock, workers: int, latency: Duration, ssz = true) =
   const
     Inbox = "0xff00000000000000000000000000000000008453"
     Batcher = "0x5050f69a9786f081509234f1a7f4684b5e5b76c9"
   echo "  ", blocks, " blocks x ", blobsPerBlock, " blobs, upstream RTT ",
-    latency, ", ", workers, " workers:"
+    (if latency == ZeroDuration: "0" else: $latency),
+    ", ", workers, " workers, ", (if ssz: "SSZ" else: "JSON"), ":"
 
   # Share a few blob buffers across the whole fake chain to keep memory flat.
   var pool: seq[BlobRef]
@@ -79,7 +80,9 @@ proc e2e(blocks, blobsPerBlock, workers: int, latency: Duration) =
   chain.head = uint64(blocks)
   chain.prewarmBlobResponses()
 
-  let (mock, url) = startMock(chain)
+  let mockBeacon = newMockBeacon()
+  mockBeacon.ssz = if ssz: MockSsz.Serve else: MockSsz.Ignore
+  let (mock, url) = startMock(chain, mockBeacon)
   let adapters = @[parseFeedSpec("base").get]
   let
     hub = FeedHub.new(adapters, ringSize = 64, queueSize = 64)
@@ -117,6 +120,7 @@ when isMainModule:
   microBenchmarks()
   let blocks = if paramCount() >= 1: parseInt(paramStr(1)) else: 300
   echo "== end-to-end catch-up (relayer + mock upstream on one core) =="
+  e2e(blocks, 6, 16, ZeroDuration, ssz = false)
   e2e(blocks, 6, 16, ZeroDuration)
   for w in [1, 4, 16, 64]:
     e2e(blocks, 6, w, 25.milliseconds)

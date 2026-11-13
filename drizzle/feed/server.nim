@@ -78,7 +78,7 @@ proc beaconJson(s: ApiServer): JsonNode =
   for ep in s.relayer.beacon.endpoints:
     result.add %*{
       "endpoint": ep.name, "role": $ep.role, "api": $ep.resolved,
-      "status": $ep.status,
+      "status": $ep.status, "ssz": $ep.ssz,
       "custodyGroups":
         if ep.custodyGroups.isSome: %ep.custodyGroups.get else: newJNull(),
       "consecutiveFailures": ep.failures,
@@ -108,8 +108,12 @@ proc statusJson(s: ApiServer): JsonNode =
     "blocksProcessed": st.blocksProcessed, "blobTxsMatched": st.blobTxsMatched,
     "blobsFetched": st.blobsFetched, "eventsPublished": st.eventsPublished,
     "decodeErrors": st.decodeErrors, "fetchErrors": st.fetchErrors,
+    "revertedSkipped": st.revertedSkipped,
     "reorgs": st.reorgs,
     "stalledAt": st.stalledAt, "stallReason": st.stallReason,
+    "kzg": %*{"enabled": s.relayer.beacon.verifyKzg,
+              "verified": s.relayer.beacon.kzgVerified,
+              "rejected": s.relayer.beacon.kzgRejected},
     "beacon": s.beaconJson(), "feeds": feeds,
   }
 

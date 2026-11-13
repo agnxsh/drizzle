@@ -15,6 +15,8 @@ import
   chronos, chronos/apps/http/httpserver, stew/byteutils, nimcrypto/sha2,
   ../drizzle/spec/eip4844
 
+from kzg4844/kzg import KzgBlob, blobToKzgCommitment
+
 export json, tables, httpserver
 
 const
@@ -29,18 +31,22 @@ type
   MockTx* = object
     sender*, to*: string
     blobs*: seq[BlobRef]
+    reverted*: bool            ## receipt status 0x0
 
   MockChain* = ref object
     head*: uint64
     blocks: Table[uint64, JsonNode]
     slotBlobs: Table[uint64, seq[VersionedHash]]  # slot -> blobs in block order
     blobs: Table[VersionedHash, MockBlob]
+    receipts: Table[string, JsonNode]   ## tx hash -> receipt
+    receiptRequests*: int
     noBlobsEndpoint*: bool     ## pretend to be a pre-Fulu beacon node
+    realKzg*: bool             ## real commitments (slow), for --verify-kzg tests
     blobsRequests*, sidecarRequests*: int
     nonce: int
     latency*: Duration         ## simulated network round trip per request
     cacheResponses*: bool      ## benchmarks: don't re-serialize blob JSON
-    responseCache: Table[string, string]
+    responseCache: Table[string, (string, string)]  ## key -> (content type, body)
 
   MockBeacon* = ref object
     ## Per-server beacon behaviour, so one chain can sit behind several
@@ -53,9 +59,16 @@ type
     partial*: bool             ## blobs never served (PeerDAS partial custody)
     sidecarsOnly*: bool        ## no /blobs endpoint
     custodyGroups*: int        ## identity metadata; < 0 = field absent
+    ssz*: MockSsz              ## how /blobs reacts to Accept: octet-stream
+    corrupt*: bool             ## flip a byte in every blob served
     genesisTime*: uint64       ## 0 = MockGenesis
     retentionEpochs*: uint64   ## spec MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS
-    blobRequests*, rateLimited*, byRootRequests*: int
+    blobRequests*, rateLimited*, byRootRequests*, sszResponses*: int
+
+  MockSsz* {.pure.} = enum
+    Serve    ## honour Accept, answer SSZ
+    Ignore   ## always JSON
+    Reject   ## 406 when SSZ is in Accept
 
 func fakeHash*(number: uint64, variant: int): Hash32 =
   var h = sha256.digest($number & "/" & $variant).data
@@ -68,7 +81,9 @@ func mockRoot*(slot: uint64): string = $fakeHash(slot, 777)
 proc newMockBeacon*(): MockBeacon =
   MockBeacon(custodyGroups: -1, retentionEpochs: 4096)
 
-proc commitFor(c: MockChain): KzgCommitment =
+proc commitFor(c: MockChain, blob: BlobRef): KzgCommitment =
+  if c.realKzg:
+    return blobToKzgCommitment(cast[ptr KzgBlob](addr blob[0])[]).expect("valid blob").bytes
   inc c.nonce
   let d = sha256.digest("commitment" & $c.nonce).data
   result[0] = 0xb0
@@ -86,14 +101,18 @@ proc setBlock*(
   for i, tx in txs:
     var hashes = newJArray()
     for b in tx.blobs:
-      let commitment = c.commitFor()
+      let commitment = c.commitFor(b)
       let vh = kzgToVersionedHash(commitment)
       c.blobs[vh] = MockBlob(commitment: commitment, blob: b)
       order.add vh
       hashes.add %($vh)
+    let txHash = $fakeHash(number * 1000 + uint64(i), variant)
     jtxs.add %*{
-      "type": "0x3", "hash": $fakeHash(number * 1000 + uint64(i), variant),
+      "type": "0x3", "hash": txHash,
       "from": tx.sender, "to": tx.to, "blobVersionedHashes": hashes}
+    c.receipts[txHash] = %*{
+      "transactionHash": txHash, "blockHash": $fakeHash(number, variant),
+      "status": (if tx.reverted: "0x0" else: "0x1")}
   # a non-blob tx too, to make sure it's skipped
   jtxs.add %*{"type": "0x2", "hash": $fakeHash(number, 99),
               "from": tx0(), "to": tx0()}
@@ -119,10 +138,15 @@ proc rpc(c: MockChain, body: string): JsonNode =
       if n <= c.head and n in c.blocks: c.blocks.getOrDefault(n)
       else: newJNull()
     %*{"jsonrpc": "2.0", "id": id, "result": blk}
+  of "eth_getTransactionReceipt":
+    inc c.receiptRequests
+    let r = c.receipts.getOrDefault(req{"params"}[0].getStr, newJNull())
+    %*{"jsonrpc": "2.0", "id": id, "result": r}
   else:
     %*{"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "nope"}}
 
-type BeaconReply = tuple[code: HttpCode, node: JsonNode, retryAfter: string]
+type BeaconReply = tuple[code: HttpCode, node: JsonNode, retryAfter: string,
+                         ssz: seq[byte]]
 
 proc beacon(
     c: MockChain, b: MockBeacon, req: HttpRequestRef, parts: seq[string]
@@ -130,19 +154,19 @@ proc beacon(
   let path = parts.join("/")
   if path == "eth/v1/beacon/genesis":
     let g = if b.genesisTime == 0: MockGenesis else: b.genesisTime
-    return (Http200, %*{"data": {"genesis_time": $g}}, "")
+    return (Http200, %*{"data": {"genesis_time": $g}}, "", @[])
   if path == "eth/v1/config/spec":
     return (Http200, %*{"data": {
       "SECONDS_PER_SLOT": $MockSlotSecs, "SLOTS_PER_EPOCH": "4",
       "MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS": $b.retentionEpochs,
-      "NUMBER_OF_CUSTODY_GROUPS": "128"}}, "")
+      "NUMBER_OF_CUSTODY_GROUPS": "128"}}, "", @[])
   if path == "eth/v1/node/identity":
     var meta = %*{"seq_number": "1"}
     if b.custodyGroups >= 0: meta["custody_group_count"] = %($b.custodyGroups)
-    return (Http200, %*{"data": {"peer_id": "mock", "metadata": meta}}, "")
+    return (Http200, %*{"data": {"peer_id": "mock", "metadata": meta}}, "", @[])
   if parts.len == 5 and parts[3] in ["blobs", "blob_sidecars", "headers"]:
     if b.failStatus != 0:
-      return (toHttpCode(b.failStatus).get(Http500), %*{"message": "mock failure"}, "")
+      return (toHttpCode(b.failStatus).get(Http500), %*{"message": "mock failure"}, "", @[])
     # block id: slot number or block root
     var slot: uint64
     if parts[4].startsWith("0x"):
@@ -151,38 +175,51 @@ proc beacon(
         if mockRoot(n) == parts[4]:
           slot = n
           found = true
-      if not found: return (Http404, %*{"message": "unknown root"}, "")
+      if not found: return (Http404, %*{"message": "unknown root"}, "", @[])
       if parts[3] != "headers": inc b.byRootRequests
     else:
       slot =
         try: parseBiggestUInt(parts[4]).uint64
-        except ValueError: return (Http400, %*{"message": "bad slot"}, "")
+        except ValueError: return (Http400, %*{"message": "bad slot"}, "", @[])
     if parts[3] == "headers":
-      if slot notin c.blocks: return (Http404, %*{"message": "no block"}, "")
-      return (Http200, %*{"data": {"root": mockRoot(slot)}}, "")
+      if slot notin c.blocks: return (Http404, %*{"message": "no block"}, "", @[])
+      return (Http200, %*{"data": {"root": mockRoot(slot)}}, "", @[])
     if slot notin c.slotBlobs:
-      return (Http404, %*{"message": "block not found"}, "")
+      return (Http404, %*{"message": "block not found"}, "", @[])
     inc b.blobRequests
     if b.rateLimited < b.rateLimitFirst:
       inc b.rateLimited
       return (Http429, %*{"message": "slow down"},
-              (if b.retryAfterSecs > 0: $b.retryAfterSecs else: ""))
+              (if b.retryAfterSecs > 0: $b.retryAfterSecs else: ""), @[])
     if parts[3] == "blobs" and (b.sidecarsOnly or c.noBlobsEndpoint):
-      return (Http404, %*{"message": "endpoint not found"}, "")
+      return (Http404, %*{"message": "endpoint not found"}, "", @[])
     if b.partial or slot < b.prunedBelowSlot or slot in b.hiddenSlots:
-      return (Http404, %*{"message": "blobs not available"}, "")
+      return (Http404, %*{"message": "blobs not available"}, "", @[])
     let order = c.slotBlobs.getOrDefault(slot)
+    proc served(vh: VersionedHash): Blob =
+      result = c.blobs.getOrDefault(vh).blob[]
+      if b.corrupt: result[100] = result[100] xor 1
     if parts[3] == "blobs":
       inc c.blobsRequests
-      var data = newJArray()
+      var selected: seq[VersionedHash]
       let hashes = req.query.getList("versioned_hashes")
       if hashes.len == 0:
-        for vh in order: data.add %(c.blobs.getOrDefault(vh).blob[].to0xHex())
+        selected = order
       for s in hashes:
         let vh = VersionedHash.fromHex(s).valueOr:
-          return (Http400, %*{"message": "bad hash"}, "")
-        data.add %(c.blobs.getOrDefault(vh).blob[].to0xHex())
-      return (Http200, %*{"data": data}, "")
+          return (Http400, %*{"message": "bad hash"}, "", @[])
+        selected.add vh
+      let wantsSsz = "application/octet-stream" in req.headers.getString("accept")
+      if wantsSsz and b.ssz == MockSsz.Reject:
+        return (Http406, %*{"message": "not acceptable"}, "", @[])
+      if wantsSsz and b.ssz == MockSsz.Serve:
+        inc b.sszResponses
+        var raw = newSeqOfCap[byte](selected.len * BYTES_PER_BLOB)
+        for vh in selected: raw.add served(vh)
+        return (Http200, nil, "", raw)
+      var data = newJArray()
+      for vh in selected: data.add %(served(vh).to0xHex())
+      return (Http200, %*{"data": data}, "", @[])
     else:
       inc c.sidecarRequests
       var data = newJArray()
@@ -193,12 +230,12 @@ proc beacon(
         for i in 0 ..< order.len: indices.add i
       for i in indices:
         if i < 0 or i >= order.len:
-          return (Http400, %*{"message": "bad index"}, "")
+          return (Http400, %*{"message": "bad index"}, "", @[])
         let bl = c.blobs.getOrDefault(order[i])
-        data.add %*{"index": $i, "blob": bl.blob[].to0xHex(),
+        data.add %*{"index": $i, "blob": served(order[i]).to0xHex(),
                     "kzg_commitment": bl.commitment.to0xHex()}
-      return (Http200, %*{"data": data}, "")
-  (Http404, %*{"message": "not found"}, "")
+      return (Http200, %*{"data": data}, "", @[])
+  (Http404, %*{"message": "not found"}, "", @[])
 
 proc prewarmBlobResponses*(c: MockChain) =
   ## Benchmarks: pre-serialize the `/blobs` response for "all blobs of the
@@ -206,14 +243,19 @@ proc prewarmBlobResponses*(c: MockChain) =
   ## CPU on the shared core during measurement.
   for slot, order in c.slotBlobs:
     if order.len == 0: continue
-    var query = ""
-    var data = newJArray()
+    var
+      query = ""
+      data = newJArray()
+      raw = newStringOfCap(order.len * BYTES_PER_BLOB)
     for i, vh in order:
       if i > 0: query.add "&"
       query.add "versioned_hashes=" & $vh
-      data.add %(c.blobs.getOrDefault(vh).blob[].to0xHex())
-    c.responseCache["/eth/v1/beacon/blobs/" & $slot & "?" & query] =
-      $(%*{"data": data})
+      let blob = c.blobs.getOrDefault(vh).blob
+      data.add %(blob[].to0xHex())
+      raw.add string.fromBytes(blob[])
+    let key = "/eth/v1/beacon/blobs/" & $slot & "?" & query
+    c.responseCache[key] = ("application/json", $(%*{"data": data}))
+    c.responseCache["ssz|" & key] = ("application/octet-stream", raw)
 
 proc startMock*(c: MockChain, b = newMockBeacon()): (HttpServerRef, string) =
   proc process(r: RequestFence): Future[HttpResponseRef] {.
@@ -225,18 +267,27 @@ proc startMock*(c: MockChain, b = newMockBeacon()): (HttpServerRef, string) =
       if c.latency > ZeroDuration:
         await sleepAsync(c.latency)
       if c.cacheResponses and req.meth == MethodGet:
-        let key = req.uri.path & "?" & req.uri.query
+        let
+          wantsSsz = b.ssz == MockSsz.Serve and
+            "application/octet-stream" in req.headers.getString("accept")
+          key = (if wantsSsz: "ssz|" else: "") & req.uri.path & "?" & req.uri.query
         if key in c.responseCache:
-          return await req.respond(Http200, c.responseCache.getOrDefault(key), headers)
-        let (code, node, _) = c.beacon(b, req, req.uri.path.strip(chars = {'/'}).split('/'))
-        let body = $node
-        if code == Http200: c.responseCache[key] = body
-        return await req.respond(code, body, headers)
+          let (ct, body) = c.responseCache.getOrDefault(key)
+          return await req.respond(Http200, body, HttpTable.init([("Content-Type", ct)]))
+        let (code, node, _, ssz) = c.beacon(b, req, req.uri.path.strip(chars = {'/'}).split('/'))
+        let (ct, body) =
+          if node.isNil: ("application/octet-stream", string.fromBytes(ssz))
+          else: ("application/json", $node)
+        if code == Http200: c.responseCache[key] = (ct, body)
+        return await req.respond(code, body, HttpTable.init([("Content-Type", ct)]))
       if req.meth == MethodPost:
         let body = string.fromBytes(await req.getBody())
         return await req.respond(Http200, $c.rpc(body), headers)
       let parts = req.uri.path.strip(chars = {'/'}).split('/')
-      let (code, node, retryAfter) = c.beacon(b, req, parts)
+      let (code, node, retryAfter, ssz) = c.beacon(b, req, parts)
+      if node.isNil:
+        return await req.respond(code, ssz,
+          HttpTable.init([("Content-Type", "application/octet-stream")]))
       var hdrs = headers
       if retryAfter.len > 0: hdrs.add("Retry-After", retryAfter)
       await req.respond(code, $node, hdrs)

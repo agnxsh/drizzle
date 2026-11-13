@@ -51,7 +51,7 @@ type Harness = object
 proc setup(
     chain: MockChain, startBlock: uint64,
     live: seq[MockBeacon] = @[newMockBeacon()], archive: seq[MockBeacon] = @[],
-    nowSlot = 110'u64): Harness =
+    nowSlot = 110'u64, verifyKzg = false): Harness =
   ## Every mock server serves the same chain; the EL comes from the first.
   var
     mocks: seq[HttpServerRef]
@@ -75,6 +75,7 @@ proc setup(
     beacon = BeaconClient.new(liveUrls, 5.seconds, BeaconApiMode.Auto,
                               archiveUrls = archiveUrls)
   beacon.clock = proc(): uint64 = MockGenesis + MockSlotSecs * nowSlot
+  beacon.verifyKzg = verifyKzg
   doAssert (waitFor beacon.init()).isOk
   let relayer = Relayer.new(
     RelayerConfig(workers: 4, windowPerWorker: 4, confirmations: 0,
@@ -97,8 +98,8 @@ proc teardown(h: Harness) =
     waitFor m.stop()
     waitFor m.closeWait()
 
-proc buildChain(): (MockChain, seq[seq[byte]], seq[byte]) =
-  let chain = MockChain()
+proc buildChain(realKzg = false): (MockChain, seq[seq[byte]], seq[byte]) =
+  let chain = MockChain(realKzg: realKzg)
   let
     basePayloads = @[payload(100_000, 1), payload(OpMaxBlobDataSize, 2)]
     arbPayload = payload(150_000, 3)
@@ -232,6 +233,38 @@ suite "Relayer end-to-end":
     check chain.sidecarRequests > 0
     teardown(h)
 
+  test "reverted txs: dropped for Arbitrum, kept for OP-stack":
+    let chain = MockChain()
+    let good = payload(150_000, 3)
+    for n in 100'u64 .. 103:
+      var txs: seq[MockTx]
+      case n
+      of 101:
+        txs.add MockTx(sender: Stranger, to: ArbInbox, reverted: true,
+                       blobs: encodeArbitrumBlobs(payload(1000, 4)))
+      of 102:
+        txs.add MockTx(sender: Stranger, to: ArbInbox,
+                       blobs: encodeArbitrumBlobs(good))
+      of 103:
+        # op-node doesn't look at receipts, so neither do OP-stack feeds
+        txs.add MockTx(sender: BaseBatcher, to: BaseInbox, reverted: true,
+                       blobs: @[encodeOpBlob(payload(10, 5)).get])
+      else: discard
+      chain.setBlock(n, 0, 0, txs)
+    chain.head = 103
+    let h = setup(chain, 100)
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 104)
+    let arb = h.hub.getFeed("arbitrum-one").get.feedEvents
+    check arb.len == 1
+    check arb[0].l1Number == 102
+    check arb[0].payloads == @[good]
+    check h.hub.getFeed("base").get.feedEvents.len == 1
+    check h.relayer.stats.revertedSkipped == 1
+    check chain.receiptRequests == 2       # only for the Arbitrum txs
+    # the reverted Arbitrum tx's blobs are never fetched
+    check h.relayer.stats.blobsFetched == uint64(encodeArbitrumBlobs(good).len + 1)
+    teardown(h)
+
 suite "Beacon robustness":
   test "fails over from a dead endpoint and backs off from it":
     let (chain, basePayloads, arbPayload) = buildChain()
@@ -287,6 +320,57 @@ suite "Beacon robustness":
     check h.hub.getFeed("arbitrum-one").get.feedEvents[0].payloads == @[arbPayload]
     check archive.byRootRequests >= 3
     check h.relayer.stats.stalledAt == 0
+    teardown(h)
+
+  test "SSZ blobs when offered, JSON when ignored or rejected":
+    for mode in [MockSsz.Serve, MockSsz.Ignore, MockSsz.Reject]:
+      let (chain, basePayloads, arbPayload) = buildChain()
+      let b = newMockBeacon()
+      b.ssz = mode
+      let h = setup(chain, 100, live = @[b])
+      check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 106)
+      check h.hub.getFeed("base").get.feedEvents[0].payloads == basePayloads
+      check h.hub.getFeed("arbitrum-one").get.feedEvents[0].payloads == @[arbPayload]
+      check h.relayer.stats.fetchErrors == 0
+      case mode
+      of MockSsz.Serve:
+        check h.beacon.endpoints[0].ssz == SszSupport.Yes
+        check b.sszResponses >= 3
+      of MockSsz.Ignore, MockSsz.Reject:
+        check h.beacon.endpoints[0].ssz == SszSupport.No
+        check b.sszResponses == 0
+      teardown(h)
+
+  test "SSZ splitter rejects partial blobs and reports short lists as missing":
+    var body = newSeq[byte](2 * BYTES_PER_BLOB)
+    body[BYTES_PER_BLOB] = 7
+    let two = splitSszBlobs(body, 2)
+    check two.isOk and two.get.len == 2 and two.get[1][0] == 7
+    check splitSszBlobs(body, 3).error.msg.startsWith("missing")
+    check splitSszBlobs(body.toOpenArray(0, body.len - 2), 2).error.kind ==
+      HttpFailureKind.Decode
+
+  test "--verify-kzg skips an endpoint serving wrong blobs":
+    let (chain, basePayloads, arbPayload) = buildChain(realKzg = true)
+    let liar = newMockBeacon()
+    liar.corrupt = true
+    let h = setup(chain, 100, live = @[liar, newMockBeacon()], verifyKzg = true)
+    check waitUntil(proc(): bool = h.relayer.stats.nextEmit == 106)
+    check h.hub.getFeed("base").get.feedEvents[0].payloads == basePayloads
+    check h.hub.getFeed("arbitrum-one").get.feedEvents[0].payloads == @[arbPayload]
+    check h.beacon.kzgRejected >= 3            # once per blob-carrying block
+    check h.beacon.kzgVerified == h.relayer.stats.blobsFetched
+    teardown(h)
+
+  test "--verify-kzg with only a bad endpoint publishes nothing":
+    let (chain, _, _) = buildChain(realKzg = true)
+    let liar = newMockBeacon()
+    liar.corrupt = true
+    let h = setup(chain, 100, live = @[liar], verifyKzg = true)
+    check waitUntil(proc(): bool = h.relayer.stats.fetchErrors > 0)
+    check h.relayer.stats.nextEmit == 101
+    check h.relayer.stats.eventsPublished == 0
+    check h.beacon.kzgVerified == 0
     teardown(h)
 
   test "a head slot not served yet is waited for, not an error":

@@ -34,7 +34,7 @@
 import
   std/[algorithm, strutils],
   chronicles,
-  ./json_http, ../spec/eip4844
+  ./json_http, ../spec/[eip4844, blob_kzg]
 
 from std/times import getTime, toUnix  # std/times' Duration clashes with chronos'
 
@@ -53,6 +53,10 @@ const
   MinCooldown = 1.seconds
   MaxCooldown = 60.seconds
   ProbeDepth = 8                     ## slots to search back for a blob-carrying block
+  SszType = "application/octet-stream"
+  BlobsAccept = SszType & ";q=1.0,application/json;q=0.9"
+    ## SSZ preferred: the blobs back to back, half the size of hex JSON and
+    ## nothing to parse. JSON stays acceptable for nodes without SSZ.
 
 type
   BeaconApiMode* {.pure.} = enum
@@ -60,6 +64,10 @@ type
 
   EndpointRole* {.pure.} = enum
     Live, Archive
+
+  SszSupport* {.pure.} = enum
+    ## Whether `/blobs` answers in SSZ (raw bytes) when asked.
+    Unknown, Yes, No
 
   EndpointStatus* {.pure.} = enum
     ## What the startup probe learned about a live endpoint.
@@ -79,6 +87,7 @@ type
     resolved*: BeaconApiMode     ## Auto until a request settles it
     status*: EndpointStatus
     custodyGroups*: Opt[uint64]
+    ssz*: SszSupport
     failures*: int               ## consecutive retryable failures
     cooldownUntil*: Moment
     prunedBelow: uint64
@@ -104,6 +113,9 @@ type
     slotsPerEpoch*: uint64
     retentionEpochs*: uint64
     custodyGroupsTotal*: uint64
+    verifyKzg*: bool             ## check every blob against its versioned hash
+    kzgVerified*: uint64         ## blobs that passed
+    kzgRejected*: uint64         ## blobs that didn't (endpoint skipped)
     clock*: proc(): uint64 {.gcsafe, raises: [].}
       ## Wall clock, unix seconds. Tests replace it.
 
@@ -295,14 +307,52 @@ func scanBlobsResponse*(
     return err("unexpected blob count")
   ok res
 
+func splitSszBlobs*(
+    body: openArray[byte], expected: int): Result[seq[BlobRef], HttpFailure] =
+  ## SSZ `List[Blob, MAX_BLOB_COMMITMENTS_PER_BLOCK]`: Blob is fixed-size, so
+  ## the list is just the blobs concatenated, no offsets.
+  if body.len mod BYTES_PER_BLOB != 0:
+    return err(HttpFailure(kind: HttpFailureKind.Decode,
+      msg: "blobs: ssz body of " & $body.len & " bytes is not whole blobs"))
+  let n = body.len div BYTES_PER_BLOB
+  if n != expected:
+    return err(missing("blobs: got " & $n & " of " & $expected))
+  var res = newSeqOfCap[BlobRef](n)
+  for i in 0 ..< n:
+    let blob = new Blob
+    copyMem(addr blob[0], unsafeAddr body[i * BYTES_PER_BLOB], BYTES_PER_BLOB)
+    res.add blob
+  ok res
+
 proc fetchViaBlobs(
-    http: JsonHttpClient, blockId: string, wanted: seq[WantedBlob]
+    ep: BeaconEndpoint, blockId: string, wanted: seq[WantedBlob]
 ): Future[Result[seq[BlobRef], HttpFailure]] {.async: (raises: [CancelledError]).} =
   var path = "/eth/v1/beacon/blobs/" & blockId
   for i, w in wanted:
     path.add(if i == 0: "?" else: "&")
     path.add "versioned_hashes=" & $w.versionedHash
-  let body = ? await http.getRaw(path)
+
+  let accept = if ep.ssz == SszSupport.No: "application/json" else: BlobsAccept
+  let typed = await ep.http.getTyped(path, accept)
+  if typed.isErr:
+    let f = typed.error
+    if ep.ssz == SszSupport.Unknown and f.kind == HttpFailureKind.Status and
+        f.status in [406, 415]:
+      # Some servers reject the Accept list outright instead of falling
+      # back to JSON. Stop asking for SSZ there.
+      ep.ssz = SszSupport.No
+      info "Beacon endpoint rejects SSZ, using JSON", endpoint = ep.name
+      return await fetchViaBlobs(ep, blockId, wanted)
+    return err(f)
+  let (contentType, body) = typed.get
+
+  if contentType.startsWith(SszType):
+    if ep.ssz != SszSupport.Yes:
+      ep.ssz = SszSupport.Yes
+      debug "Beacon endpoint serves SSZ blobs", endpoint = ep.name
+    return splitSszBlobs(body, wanted.len)
+  if ep.ssz == SszSupport.Unknown and accept == BlobsAccept:
+    ep.ssz = SszSupport.No   # asked for SSZ, got JSON: don't keep asking
 
   let fast = scanBlobsResponse(body, wanted.len)
   if fast.isOk:
@@ -364,11 +414,11 @@ proc fetchFrom(
 ): Future[Result[seq[BlobRef], HttpFailure]] {.async: (raises: [CancelledError]).} =
   case ep.resolved
   of BeaconApiMode.Blobs:
-    await fetchViaBlobs(ep.http, blockId, wanted)
+    await fetchViaBlobs(ep, blockId, wanted)
   of BeaconApiMode.Sidecars:
     await fetchViaSidecars(ep.http, blockId, wanted)
   of BeaconApiMode.Auto:
-    let viaBlobs = await fetchViaBlobs(ep.http, blockId, wanted)
+    let viaBlobs = await fetchViaBlobs(ep, blockId, wanted)
     # Several workers may be probing concurrently; only the first one to
     # land flips the mode and logs it.
     if viaBlobs.isOk:
@@ -428,13 +478,34 @@ type Tally = ref object
   lastMissing: bool    ## the most recent attempt was a "not found"
   errors: seq[string]
 
+proc verified(
+    c: BeaconClient, ep: BeaconEndpoint, blobs: seq[BlobRef],
+    wanted: seq[WantedBlob], t: Tally): bool =
+  if not c.verifyKzg:
+    return true
+  for i, b in blobs:
+    let res = verifyBlob(b[], wanted[i].versionedHash)
+    if res.isErr:
+      inc c.kzgRejected
+      t.invalid = true
+      t.errors.add ep.name & ": blob index " & $wanted[i].index & ": " & res.error
+      error "Beacon endpoint returned a blob that fails KZG verification, " &
+        "trying another endpoint", endpoint = ep.name,
+        blobIndex = wanted[i].index, error = res.error
+      return false
+  c.kzgVerified += uint64(blobs.len)
+  true
+
 proc attempt(
-    ep: BeaconEndpoint, blockId: string, wanted: seq[WantedBlob], t: Tally
+    c: BeaconClient, ep: BeaconEndpoint, blockId: string,
+    wanted: seq[WantedBlob], t: Tally
 ): Future[Opt[seq[BlobRef]]] {.async: (raises: [CancelledError]).} =
   t.lastMissing = false
   let res = await ep.fetchFrom(blockId, wanted)
   if res.isOk:
     ep.recovered()
+    if not c.verified(ep, res.get, wanted, t):
+      return Opt.none(seq[BlobRef])
     return Opt.some(res.get)
   let f = res.error
   t.errors.add ep.name & ": " & $f
@@ -497,7 +568,7 @@ proc fetchBlobs*(
     if ep.cooldownUntil > now:
       t.retryable = true
       continue
-    let got = await ep.attempt($slot, wanted, t)
+    let got = await c.attempt(ep, $slot, wanted, t)
     if got.isSome:
       return ok got.get
     if expired and t.lastMissing:
@@ -515,7 +586,7 @@ proc fetchBlobs*(
         if ep.cooldownUntil > Moment.now():
           t.retryable = true
           continue
-        let got = await ep.attempt(root.get, wanted, t)
+        let got = await c.attempt(ep, root.get, wanted, t)
         if got.isSome:
           return ok got.get
 

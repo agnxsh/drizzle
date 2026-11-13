@@ -37,5 +37,7 @@ func decodeRaw(blobs: openArray[BlobRef]): Result[seq[seq[byte]], string] =
   ok newSeq[seq[byte]]()
 
 registerAdapterKind("opstack", decodeOpStack)
-registerAdapterKind("arbitrum", decodeArbitrum)
+# Nitro's inbox reader takes batches from SequencerBatchDelivered events, so
+# a reverted addSequencerL2BatchFromBlobs is not a batch.
+registerAdapterKind("arbitrum", decodeArbitrum, requireSuccess = true)
 registerAdapterKind("raw", decodeRaw)

@@ -25,6 +25,10 @@ type
   ElClient* = ref object
     http*: JsonHttpClient
 
+  TxReceipt* = object
+    blockHash*: Hash32
+    success*: bool          ## receipt status 0x1
+
 func jstr(n: JsonNode, key: string): string =
   let v = n{key}
   if v.isNil or v.kind != JString: "" else: v.str
@@ -101,3 +105,19 @@ proc getBlock*(
   if blk.number != number:
     return err("node returned block " & $blk.number & " for " & $number)
   ok(Opt.some(blk))
+
+proc getReceipt*(
+    c: ElClient, txHash: Hash32
+): Future[Result[Opt[TxReceipt], string]] {.async: (raises: [CancelledError]).} =
+  ## `Opt.none` when the node doesn't know the tx (yet).
+  let n = (await c.http.rpcCall("eth_getTransactionReceipt", %*[$txHash])).valueOr:
+    return err($error)
+  if n.kind == JNull:
+    return ok(Opt.none(TxReceipt))
+  if n.kind != JObject:
+    return err("receipt is not an object")
+  let blockHash = Hash32.fromHex(n.jstr("blockHash")).valueOr:
+    return err("receipt: bad blockHash")
+  let status = parseQuantity(n.jstr("status")).valueOr:
+    return err("receipt: bad status")
+  ok(Opt.some(TxReceipt(blockHash: blockHash, success: status == 1)))

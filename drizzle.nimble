@@ -24,6 +24,7 @@ requires "nim >= 2.2.10",
          "stew >= 0.6.5",
          "nimcrypto >= 0.7.3",
          "confutils >= 0.2.0",
+         "kzg4844 >= 0.2.0",
          "unittest2 >= 0.3.0"
 
 task test, "Run all tests":

@@ -51,6 +51,7 @@ type
     eventsPublished*: uint64
     decodeErrors*: uint64
     fetchErrors*: uint64
+    revertedSkipped*: uint64 ## matched txs dropped because they reverted
     reorgs*: uint64
     stalledAt*: uint64       ## block the pipeline is stuck on (0 = not stuck)
     stallReason*: string     ## why, e.g. blobs pruned from the beacon node
@@ -121,7 +122,32 @@ proc processBlock(
   # Cheap path: most blocks have no tx for any configured L2.
   var matches: seq[(BlobTx, seq[L2Adapter])]
   for tx in blk.blobTxs:
-    let adapters = r.index.matching(tx)
+    var adapters = r.index.matching(tx)
+    if adapters.len == 0:
+      continue
+    var needsSuccess = false
+    for a in adapters:
+      needsSuccess = needsSuccess or a.requireSuccess
+    if needsSuccess:
+      # Look before fetching blobs: a reverted tx's blobs are skipped.
+      let receipt = (await r.el.getReceipt(tx.hash)).valueOr:
+        return err(ProcessError(msg: "el receipt: " & error))
+      if receipt.isNone:
+        return err(ProcessError(notYet: true, msg: "receipt not available yet"))
+      if receipt.get.blockHash != blk.hash:
+        # The block was replaced since we read it; the retry rereads it.
+        return err(ProcessError(msg: "receipt for tx " & $tx.hash &
+          " is from another block (reorg in progress)"))
+      if not receipt.get.success:
+        var kept: seq[L2Adapter]
+        for a in adapters:
+          if a.requireSuccess:
+            info "Skipping reverted batch tx", feed = a.name,
+              l1Number = number, tx = $tx.hash
+          else:
+            kept.add a
+        adapters = kept
+        inc r.stats.revertedSkipped
     if adapters.len > 0:
       matches.add (tx, adapters)
   if matches.len == 0:

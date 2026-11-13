@@ -57,11 +57,16 @@ against a mock EL + beacon node:
 
 | upstream RTT | workers | blocks/s | blobs/s | blob MB/s |
 |--------------|--------:|---------:|--------:|----------:|
-| 0            | 16      | 154      | 926     | 122       |
-| 25 ms        | 1       | 17       | 103     | 13        |
-| 25 ms        | 4       | 51       | 309     | 41        |
-| 25 ms        | 16      | 100      | 600     | 79        |
-| 25 ms        | 64      | 139      | 834     | 109       |
+| 0 (JSON)     | 16      | 136      | 819     | 107       |
+| 0 (SSZ)      | 16      | 267      | 1,604   | 210       |
+| 25 ms (SSZ)  | 1       | 18       | 108     | 14        |
+| 25 ms (SSZ)  | 4       | 59       | 358     | 47        |
+| 25 ms (SSZ)  | 16      | 138      | 832     | 109       |
+| 25 ms (SSZ)  | 64      | 227      | 1,363   | 179       |
+
+Blobs are requested as SSZ (raw bytes) and fall back to JSON when the
+beacon node doesn't offer it. SSZ is about 2x faster once enough workers
+hide the latency.
 
 The end-to-end figures are a lower bound, because the mock upstream shares
 the relayer's core. Mainnet's maximum is 21 blobs per 12 s block, about
@@ -107,10 +112,16 @@ Beacon endpoints:
   `--beacon-archive-url` (any beacon-API-compatible blob archive). Without
   one, drizzle stops at the first pruned block and says why. It never
   silently skips a batch.
+- `--verify-kzg` checks every blob against the versioned hash in its L1
+  transaction (recomputes the KZG commitment, ~4 ms per blob). A beacon node
+  serving wrong data is skipped. It's off by default because it caps
+  backfill at about 240 blobs/s.
 
 `--feed` takes a preset name (`base`, `optimism`, `arbitrum-one`) or
 `<name>:<kind>:<inbox>[:<batcher>,...]`, where kind is `opstack`, `arbitrum`
-or `raw`. Leave out batchers to accept any sender. Run `--help` for all options
+or `raw`. Leave out batchers to accept any sender. `arbitrum` feeds skip
+transactions that reverted (Nitro only takes batches from successful calls);
+`opstack` feeds don't, matching op-node. Run `--help` for all options
 (workers, confirmations, start block, ring size and so on).
 
 > Preset addresses were correct when written, but batchers rotate. Verify
@@ -173,4 +184,4 @@ bench/            throughput benchmarks
 
 See [NOTES.md](NOTES.md) for design decisions, measurements and open items.
 Blobs are not KZG-verified by default; drizzle trusts its beacon node, so
-point it at one you run. Opt-in verification (`--verify-kzg`) is on the roadmap.
+point it at one you run, or pass `--verify-kzg`.

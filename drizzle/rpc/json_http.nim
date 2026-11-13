@@ -91,15 +91,19 @@ proc closeWait*(c: JsonHttpClient) {.async: (raises: []).} =
 
 type RawResponse = object
   status: int
+  contentType: string
   data: seq[byte]
   retryAfter: Opt[Duration]
 
+const JsonType = "application/json"
+
 proc request(
-    c: JsonHttpClient, meth: HttpMethod, path: string, body: seq[byte]
+    c: JsonHttpClient, meth: HttpMethod, path: string, body: seq[byte],
+    accept = JsonType
 ): Future[Result[RawResponse, HttpFailure]] {.async: (raises: [CancelledError]).} =
   let headers =
-    if body.len > 0: @[("Content-Type", "application/json"), ("Accept", "application/json")]
-    else: @[("Accept", "application/json")]
+    if body.len > 0: @[("Content-Type", JsonType), ("Accept", accept)]
+    else: @[("Accept", accept)]
   let address = getHttpAddress(parseUri(c.baseUrl & path)).valueOr:
     return err(failure(HttpFailureKind.Transport, "bad url: " & $error))
   let req = HttpClientRequestRef.new(
@@ -108,7 +112,9 @@ proc request(
   proc exchange(): Future[RawResponse] {.async: (raises: [CancelledError, HttpError]).} =
     let resp = await req.send()
     try:
-      var r = RawResponse(status: resp.status)
+      var r = RawResponse(
+        status: resp.status,
+        contentType: resp.headers.getString("content-type").toLowerAscii)
       if resp.status in [429, 503]:
         r.retryAfter = parseRetryAfter(resp.headers.getString("retry-after"))
       r.data = await resp.getBodyBytes()
@@ -135,17 +141,25 @@ proc parseBody(data: openArray[byte]): Result[JsonNode, HttpFailure] =
   except CatchableError as exc:
     err(failure(HttpFailureKind.Decode, exc.msg))
 
-proc getRaw*(
-    c: JsonHttpClient, path: string
-): Future[Result[seq[byte], HttpFailure]] {.async: (raises: [CancelledError]).} =
-  ## Body bytes of a 200 response, for callers with their own fast parser.
-  let resp = ? await c.request(MethodGet, path, @[])
+proc getTyped*(
+    c: JsonHttpClient, path: string, accept: string
+): Future[Result[(string, seq[byte]), HttpFailure]] {.async: (raises: [CancelledError]).} =
+  ## `(content-type, body)` of a 200 response, for content negotiation
+  ## (e.g. SSZ with a JSON fallback). The content type is lowercased.
+  let resp = ? await c.request(MethodGet, path, @[], accept)
   if resp.status != 200:
     let snippet = string.fromBytes(resp.data[0 ..< min(resp.data.len, 256)])
     var f = failure(HttpFailureKind.Status, snippet, resp.status)
     f.retryAfter = resp.retryAfter
     return err(f)
-  ok resp.data
+  ok (resp.contentType, resp.data)
+
+proc getRaw*(
+    c: JsonHttpClient, path: string
+): Future[Result[seq[byte], HttpFailure]] {.async: (raises: [CancelledError]).} =
+  ## Body bytes of a 200 response, for callers with their own fast parser.
+  let (_, data) = ? await c.getTyped(path, JsonType)
+  ok data
 
 proc parseJsonBody*(data: openArray[byte]): Result[JsonNode, HttpFailure] =
   parseBody(data)

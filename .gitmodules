@@ -41,3 +41,6 @@
 	path = vendor/Nim
 	url = https://github.com/nim-lang/Nim
 	shallow = true
+[submodule "vendor/nim-kzg4844"]
+	path = vendor/nim-kzg4844
+	url = https://github.com/status-im/nim-kzg4844

@@ -65,6 +65,8 @@ supported secondary path, not a requirement.
   nimcrypto, confutils, unittest2 and their transitive deps
   (bearssl, http-utils, serialization, json-serialization, faststreams,
   testutils).
+- `vendor/nim-kzg4844` - c-kzg-4844 + blst for `--verify-kzg`; nested
+  submodules, so `make update` (recursive) is required.
 - `vendor/Nim` - the compiler itself, pinned at v2.2.12, shallow submodule.
   Needed because current chronos/bearssl/confutils require Nim >= 2.2.10 and
   the system Nim was 2.2.0 (chronos failed with a raises-tracking error under
@@ -206,13 +208,59 @@ nodes. `--beacon-api=auto|blobs|sidecars`:
   miss, never whether drizzle asks. The actual pruned path is covered by the
   mock tests only, because no public node that prunes on schedule was at hand.
 
- blob ↔ commitment
-with a KZG proof by default; we trust the beacon node. Planned as an opt-in
-`--verify-kzg` flag (off by default, per the 2026-11-10 decision): vendor
-`c-kzg-4844` (or `nim-kzg4844`) and, when the flag is set, run
-`verify_blob_kzg_proof_batch` for sidecars, or compute the commitment for
-`blobs` responses. The cost only applies when asked for. Without the flag,
-run drizzle against a beacon node you control.
+### KZG verification (`--verify-kzg`, 2026-11-13)
+
+Off by default (2026-11-10 decision): without it drizzle trusts its beacon
+node, so run it against one you control. With the flag, every fetched blob's
+KZG commitment is **recomputed** (`blob_to_kzg_commitment`) and its
+versioned hash compared to the one in the L1 tx. That binds the blob to the
+transaction. It also rejects non-canonical field elements.
+
+- Library: `vendor/nim-kzg4844` (c-kzg-4844 + blst, nested submodule; the
+  same binding nimbus-eth2 uses). The trusted setup is embedded at compile
+  time, and `loadKzgSetup` runs it once at startup (~1.5 s) when the flag is
+  set. Always compiled in, only run on demand.
+- Recompute rather than proof check: `/blobs` returns no commitments or
+  proofs, so there's nothing to check a proof against. One code path for
+  both APIs. Measured 4.2 ms per blob (one core), about 240 blobs/s. That is
+  ~130x mainnet's live maximum, but it caps backfill well below the
+  1,600 blobs/s SSZ path. Moving it to a thread pool is the fix if backfill
+  with verification matters.
+- A blob that fails is that endpoint's fault: logged as an error, counted
+  (`kzg.rejected` in `/v1/status`), and the next endpoint is tried. If none
+  passes, the block retries as an `Invalid` fetch error and nothing is
+  published.
+- Mainnet run: 114 blobs (Base, OP, Arbitrum) verified, 0 rejected.
+
+### SSZ blob responses (2026-11-13)
+
+`/blobs` is requested with
+`Accept: application/octet-stream;q=1.0,application/json;q=0.9`. SSZ
+`List[Blob, N]` of a fixed-size type is just the blobs concatenated, so
+decoding is a length check plus one copy per blob. Per endpoint
+(`ssz` in `/v1/status`):
+- SSZ answer → `Yes`
+- JSON answer → `No` (stop asking)
+- 406/415 → `No` and retry in JSON
+
+Bench: JSON 819 → SSZ 1,604 blobs/s at 0 RTT, 16 workers. At 25 ms with
+64 workers, 838 → 1,363 (the JSON run was CPU-bound there too). Sidecars stay JSON:
+deprecated since Fulu, and their SSZ layout depends on the fork's
+inclusion-proof depth.
+
+PublicNode (Lighthouse behind Cloudflare) answers JSON even to a plain
+`Accept: application/octet-stream`, so it's `No` there. A local node is
+where SSZ pays off.
+
+### Fetch by root for live nodes: dropped (2026-11-13)
+
+Considered and dropped. By-root was meant to pin the exact fork. But
+`/blobs?versioned_hashes=` only returns blobs whose hashes match what the
+tx committed to, and sidecars are checked commitment → versioned hash. So a
+slot that moved to another fork gives "missing" (then retry), never wrong
+data. It also costs an extra request: EIP-4788's `parentBeaconBlockRoot`
+is the parent's root, so it would need the child block or a headers call.
+Archives still go by root (that's how they index).
 
 ## 7. L2 blob encodings
 
@@ -232,6 +280,24 @@ packed LSB-first (3072 bytes): 130048 bytes per blob. Concatenate across
 **all blobs of the tx**, then RLP-decode a single byte string. One payload
 per tx; it starts with Nitro's batch header byte (`0x00` = brotli). We only
 need an RLP *string* decoder (`spec/rlp_lite.nim`), not general RLP.
+
+### Reverted transactions (2026-11-13)
+
+A matched blob tx can revert (e.g. the inbox contract rejects it); its blobs
+are still in the block. Whether that matters depends on how the L2 derives
+batches, so it's a per adapter kind setting (`requireSuccess`):
+- `arbitrum`: **yes**. Nitro's inbox reader takes batches from
+  `SequencerBatchDelivered` events, and a reverted
+  `addSequencerL2BatchFromBlobs` emits none.
+- `opstack`: **no**. op-node's `isValidBatchTx` checks type, `to` and sender
+  only, never the receipt (the inbox is an EOA, so it can't revert anyway).
+  Checking would only cost an RPC call per batch.
+- `raw`: no.
+
+When needed, `eth_getTransactionReceipt` runs **before** the blob fetch, so a
+reverted tx's blobs aren't downloaded. A null receipt means "not yet". A
+receipt from another block hash means a reorg is in progress, so retry. Skips
+are counted in `revertedSkipped` and logged per feed.
 
 ### Presets
 Addresses as known at time of writing. **Verify against each chain's official
@@ -337,11 +403,12 @@ sharing one core, so this is a lower bound):
 
 | upstream RTT | workers | blocks/s | blobs/s | blob MB/s |
 |--------------|--------:|---------:|--------:|----------:|
-| 0            | 16      | 155      | 935     | 123       |
-| 25 ms        | 1       | 17       | 103     | 13        |
-| 25 ms        | 4       | 51       | 311     | 41        |
-| 25 ms        | 16      | 101      | 611     | 80        |
-| 25 ms        | 64      | 139      | 838     | 110       |
+| 0 (JSON)     | 16      | 136      | 819     | 107       |
+| 0 (SSZ)      | 16      | 267      | 1,604   | 210       |
+| 25 ms (SSZ)  | 1       | 18       | 108     | 14        |
+| 25 ms (SSZ)  | 4       | 59       | 358     | 47        |
+| 25 ms (SSZ)  | 16      | 138      | 832     | 109       |
+| 25 ms (SSZ)  | 64      | 227      | 1,363   | 179       |
 
 Mainnet max (21 blobs / 12 s) is 1.75 blobs/s, so live-following is a non-issue;
 the numbers matter for **catch-up/backfill** and for remote RPC providers
@@ -372,8 +439,7 @@ Optimisation log, with what did and didn't help:
 Where the next 2x would come from:
 - move hex decode + L2 decode to a thread pool (nim-taskpools, as Nimbus
   does); `DecodeProc` is already pure and `{.noSideEffect.}` for this reason
-- SSZ (`Accept: application/octet-stream`) from the beacon API where
-  supported: no hex at all, half the bytes on the wire
+- ~~SSZ from the beacon API~~ done (2026-11-13): 2x at 0 RTT
 - `eth_getBlockByNumber(n, false)` + `eth_getTransactionByHash` only for
   blob txs, or `eth_getBlockReceipts` filtering, to cut EL JSON for busy blocks
 
@@ -381,15 +447,14 @@ Where the next 2x would come from:
 
 - [x] Beacon robustness: multi-endpoint failover, Retry-After, pruned
       detection + archive fallback, PeerDAS probe (section 6).
-- [ ] Fetch by block root for live nodes too (exact fork; EIP-4788 gives the
-      parent root, so this needs the child block or a headers lookup).
-- [ ] SSZ blob responses (`Accept: application/octet-stream`): half the
-      bytes and no hex decode.
-- [ ] Check tx receipt status for matched blob txs (a reverted tx to an
-      inbox contract still sits in the block).
-- [ ] Optional KZG verification behind `--verify-kzg` (off by default,
-      section 6): vendor c-kzg-4844 as a submodule; only linked into the
-      hot path when the flag is set.
+- [x] ~~Fetch by block root for live nodes~~ dropped, no correctness gain
+      (section 6).
+- [x] SSZ blob responses with JSON fallback (section 6).
+- [x] Receipt status check, per adapter kind: Arbitrum yes, OP-stack no
+      (section 7).
+- [x] Opt-in `--verify-kzg` via nim-kzg4844 (section 6).
+- [ ] KZG verification on a thread pool (nim-taskpools), so backfill with
+      `--verify-kzg` isn't capped at ~240 blobs/s on the event loop.
 - [ ] Beacon-API-compatible serving (`/eth/v1/beacon/blob_sidecars/{id}`
       from cache) so op-node / nitro can point `--l1.beacon` at drizzle
       unchanged. Needs proofs + inclusion proofs on sidecars, so it depends on
